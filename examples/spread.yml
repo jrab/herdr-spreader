@@ -1,0 +1,36 @@
+workspaces:
+  - name: frontend
+    root: ~/code/my-project/frontend
+    env:
+      NODE_ENV: development
+    tabs:
+      - label: editor
+        cwd: ./src
+        panes:
+          - command: nvim
+          - split: down
+            ratio: 0.3
+            command: npm run dev
+            wait_for:
+              match: "ready"
+              timeout_ms: 10000
+  - name: backend
+    root: ~/code/my-project/backend
+    focus: true
+    env:
+      RUST_LOG: debug
+    tabs:
+      - label: editor
+        cwd: ./src
+        panes:
+          - command: nvim
+            focus: true
+          - split: down
+            ratio: 0.3
+            command: cargo watch -x test
+            wait_for:
+              match: "Compiling"
+              timeout_ms: 10000
+      - label: server
+        panes:
+          - command: cargo run
