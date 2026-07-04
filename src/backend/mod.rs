@@ -53,15 +53,56 @@ pub enum BackendError {
 }
 
 pub trait HerdrBackend {
+    /// Create a new workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if the underlying command fails.
     fn create_workspace(&mut self, opts: &WorkspaceOpts) -> Result<WorkspaceCreated, BackendError>;
+
+    /// Rename an existing tab.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if the underlying command fails.
     fn rename_tab(&mut self, tab_id: &str, label: &str) -> Result<(), BackendError>;
+
+    /// Create a new tab inside the given workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if the underlying command fails.
     fn create_tab(
         &mut self,
         workspace_id: &str,
         opts: &TabOpts,
     ) -> Result<TabCreated, BackendError>;
+
+    /// Split an existing pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if the underlying command fails.
     fn split_pane(&mut self, from_pane: &str, opts: &SplitOpts) -> Result<String, BackendError>;
+
+    /// Run a command inside the given pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if the underlying command fails.
     fn run(&mut self, pane_id: &str, command: &str) -> Result<(), BackendError>;
+
+    /// Wait for output matching a pattern inside the given pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if the underlying command fails.
     fn wait_output(&mut self, pane_id: &str, wait: &WaitFor) -> Result<(), BackendError>;
+
+    /// Focus the given pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if the underlying command fails.
     fn focus_pane(&mut self, pane_id: &str) -> Result<(), BackendError>;
 }

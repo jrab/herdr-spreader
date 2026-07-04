@@ -27,6 +27,12 @@ pub struct SpreadFile {
 
 impl SpreadFile {
     #[allow(clippy::should_implement_trait)]
+    /// Parse a [`SpreadFile`] from a YAML string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`serde_yaml_ng::Error`] if the input is not valid YAML or does
+    /// not match the expected schema.
     pub fn from_str(s: &str) -> Result<Self, serde_yaml_ng::Error> {
         serde_yaml_ng::from_str(s)
     }
@@ -101,13 +107,19 @@ pub fn resolve_config_path(explicit: Option<PathBuf>, env: &BTreeMap<String, Str
         return PathBuf::from(plugin_config_dir).join(CONFIG_FILE_NAME);
     }
 
-    let home = env.get("HOME").map(String::as_str).unwrap_or("");
+    let home = env.get("HOME").map_or("", String::as_str);
     PathBuf::from(home)
         .join(".config")
         .join("herdr-spreader")
         .join(CONFIG_FILE_NAME)
 }
 
+/// Load a [`SpreadFile`] from a YAML file on disk.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Io`] if the file cannot be read, or
+/// [`ConfigError::Parse`] if its contents are not valid YAML.
 pub fn load_config(path: &Path) -> Result<SpreadFile, ConfigError> {
     let contents = fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
@@ -119,6 +131,7 @@ pub fn load_config(path: &Path) -> Result<SpreadFile, ConfigError> {
     })
 }
 
+#[must_use]
 pub fn resolve_paths(file: SpreadFile, env: &BTreeMap<String, String>, cwd: &Path) -> SpreadFile {
     SpreadFile {
         workspaces: file
@@ -163,7 +176,7 @@ fn expand_root_path(path: &Path, env: &BTreeMap<String, String>, cwd: &Path) -> 
 
 fn expand_tilde(path: &Path, env: &BTreeMap<String, String>) -> PathBuf {
     let path_str = path.to_string_lossy();
-    let home = env.get("HOME").map(String::as_str).unwrap_or("");
+    let home = env.get("HOME").map_or("", String::as_str);
     if path_str == "~" {
         PathBuf::from(home)
     } else if let Some(rest) = path_str.strip_prefix("~/") {

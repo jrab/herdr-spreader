@@ -18,11 +18,11 @@ fn resolve_cwd(
 fn combine_cwd(base: Option<&Path>, overlay: Option<&Path>) -> Option<PathBuf> {
     match (base, overlay) {
         (Some(_base), Some(overlay)) if overlay.is_absolute() => {
-            Some(normalize_path(overlay.to_path_buf()))
+            Some(normalize_path(overlay))
         }
-        (Some(base), Some(overlay)) => Some(normalize_path(base.join(overlay))),
-        (Some(base), None) => Some(normalize_path(base.to_path_buf())),
-        (None, Some(overlay)) => Some(normalize_path(overlay.to_path_buf())),
+        (Some(base), Some(overlay)) => Some(normalize_path(&base.join(overlay))),
+        (Some(base), None) => Some(normalize_path(base)),
+        (None, Some(overlay)) => Some(normalize_path(overlay)),
         (None, None) => None,
     }
 }
@@ -57,7 +57,7 @@ fn wrap_command_with_cwd_and_env(
     }
 }
 
-fn normalize_path(path: PathBuf) -> PathBuf {
+fn normalize_path(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
         if component != Component::CurDir {
@@ -75,6 +75,14 @@ pub enum EngineError {
     WaitForWithoutCommand,
 }
 
+/// Apply the workspace layout described by `file`, creating workspaces, tabs,
+/// and panes, then focusing the appropriate pane.
+///
+/// # Errors
+///
+/// Returns [`EngineError::Backend`] if any backend operation fails, or
+/// [`EngineError::WaitForWithoutCommand`] if a pane specifies `wait_for`
+/// without a `command`.
 pub fn apply(file: &SpreadFile, backend: &mut dyn HerdrBackend) -> Result<(), EngineError> {
     let mut chosen: Option<String> = None;
     for ws in &file.workspaces {
@@ -89,6 +97,14 @@ pub fn apply(file: &SpreadFile, backend: &mut dyn HerdrBackend) -> Result<(), En
     Ok(())
 }
 
+/// Apply a single workspace configuration, creating the workspace, its tabs,
+/// and panes, then returning the id of the pane that should receive focus.
+///
+/// # Errors
+///
+/// Returns [`EngineError::Backend`] if any backend operation fails, or
+/// [`EngineError::WaitForWithoutCommand`] if a pane specifies `wait_for`
+/// without a `command`.
 pub fn apply_workspace(
     ws: &Workspace,
     backend: &mut dyn HerdrBackend,
@@ -154,34 +170,31 @@ pub fn apply_workspace(
                 None
             };
 
-            match &pane.command {
-                Some(command) => {
-                    let command_to_run = if pane_index == 0 {
-                        wrap_command_with_cwd_and_env(command, resolved_cwd.as_deref(), &pane.env)
-                    } else {
-                        command.clone()
-                    };
+            if let Some(command) = &pane.command {
+                let command_to_run = if pane_index == 0 {
+                    wrap_command_with_cwd_and_env(command, resolved_cwd.as_deref(), &pane.env)
+                } else {
+                    command.clone()
+                };
 
-                    backend.run(&pane_id, &command_to_run)?;
+                backend.run(&pane_id, &command_to_run)?;
 
-                    if let Some(wait_for) = &pane.wait_for {
-                        backend.wait_output(&pane_id, wait_for)?;
-                    }
+                if let Some(wait_for) = &pane.wait_for {
+                    backend.wait_output(&pane_id, wait_for)?;
                 }
-                None => {
-                    if pane.wait_for.is_some() {
-                        return Err(EngineError::WaitForWithoutCommand);
-                    }
-                    if pane_index == 0
-                        && let Some(prefix) = cwd_env_prefix(resolved_cwd.as_deref(), &pane.env)
-                    {
-                        backend.run(&pane_id, &prefix)?;
-                    }
+            } else {
+                if pane.wait_for.is_some() {
+                    return Err(EngineError::WaitForWithoutCommand);
+                }
+                if pane_index == 0
+                    && let Some(prefix) = cwd_env_prefix(resolved_cwd.as_deref(), &pane.env)
+                {
+                    backend.run(&pane_id, &prefix)?;
                 }
             }
 
             if pane.focus {
-                focus_pane_id = pane_id.clone();
+                focus_pane_id.clone_from(&pane_id);
             }
 
             previous_pane_id = pane_id;

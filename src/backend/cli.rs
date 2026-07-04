@@ -10,7 +10,7 @@ use crate::config::{SplitDirection, WaitFor};
 
 pub(crate) fn workspace_create_args(opts: &WorkspaceOpts) -> Vec<String> {
     let mut args = vec!["workspace".to_string(), "create".to_string()];
-    push_cwd(&mut args, &opts.cwd);
+    push_cwd(&mut args, opts.cwd.as_ref());
     args.push("--label".to_string());
     args.push(opts.label.clone());
     push_env(&mut args, &opts.env);
@@ -25,7 +25,7 @@ pub(crate) fn tab_create_args(workspace_id: &str, opts: &TabOpts) -> Vec<String>
         "--workspace".to_string(),
         workspace_id.to_string(),
     ];
-    push_cwd(&mut args, &opts.cwd);
+    push_cwd(&mut args, opts.cwd.as_ref());
     if let Some(label) = &opts.label {
         args.push("--label".to_string());
         args.push(label.clone());
@@ -46,7 +46,7 @@ pub(crate) fn pane_split_args(from_pane: &str, opts: &SplitOpts) -> Vec<String> 
         args.push("--ratio".to_string());
         args.push(ratio.to_string());
     }
-    push_cwd(&mut args, &opts.cwd);
+    push_cwd(&mut args, opts.cwd.as_ref());
     push_env(&mut args, &opts.env);
     push_focus_flag(&mut args, opts.focus);
     args
@@ -96,7 +96,7 @@ fn direction_str(direction: SplitDirection) -> &'static str {
     }
 }
 
-fn push_cwd(args: &mut Vec<String>, cwd: &Option<PathBuf>) {
+fn push_cwd(args: &mut Vec<String>, cwd: Option<&PathBuf>) {
     if let Some(cwd) = cwd {
         args.push("--cwd".to_string());
         args.push(cwd.display().to_string());
@@ -223,14 +223,13 @@ pub struct CliBackend {
 }
 
 impl CliBackend {
+    #[must_use]
     pub fn new(bin: PathBuf) -> Self {
         Self { bin }
     }
 
     pub fn resolve_bin(env: &BTreeMap<String, String>) -> PathBuf {
-        env.get("HERDR_BIN_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_HERDR_BIN))
+        env.get("HERDR_BIN_PATH").map_or_else(|| PathBuf::from(DEFAULT_HERDR_BIN), PathBuf::from)
     }
 
     fn exec(&self, args: &[String]) -> Result<String, BackendError> {
@@ -259,6 +258,7 @@ impl CliBackend {
     /// not running, pane gone, unexpected response) rather than propagating an
     /// error, since callers treat this as an optional hint with a sensible
     /// fallback.
+    #[must_use]
     pub fn query_pane_cwd(&self, pane_id: &str) -> Option<PathBuf> {
         let stdout = self.exec(&pane_get_args(pane_id)).ok()?;
         parse_pane_cwd(&stdout).ok().flatten()
