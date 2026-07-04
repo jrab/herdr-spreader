@@ -17,9 +17,7 @@ fn resolve_cwd(
 
 fn combine_cwd(base: Option<&Path>, overlay: Option<&Path>) -> Option<PathBuf> {
     match (base, overlay) {
-        (Some(_base), Some(overlay)) if overlay.is_absolute() => {
-            Some(normalize_path(overlay))
-        }
+        (Some(_base), Some(overlay)) if overlay.is_absolute() => Some(normalize_path(overlay)),
         (Some(base), Some(overlay)) => Some(normalize_path(&base.join(overlay))),
         (Some(base), None) => Some(normalize_path(base)),
         (None, Some(overlay)) => Some(normalize_path(overlay)),

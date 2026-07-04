@@ -229,7 +229,8 @@ impl CliBackend {
     }
 
     pub fn resolve_bin(env: &BTreeMap<String, String>) -> PathBuf {
-        env.get("HERDR_BIN_PATH").map_or_else(|| PathBuf::from(DEFAULT_HERDR_BIN), PathBuf::from)
+        env.get("HERDR_BIN_PATH")
+            .map_or_else(|| PathBuf::from(DEFAULT_HERDR_BIN), PathBuf::from)
     }
 
     fn exec(&self, args: &[String]) -> Result<String, BackendError> {
