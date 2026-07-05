@@ -78,7 +78,7 @@ or trigger it from herdr's action menu (`Apply layout`).
 
 ```bash
 cargo build --release
-./target/release/herdr-spreader apply --file ./spread.yml
+./target/release/herdr-spreader apply --file ./config.yaml
 ```
 
 This works outside of a herdr session too, as long as a herdr server is already running (`herdr server` or `brew services start herdr`) and the `herdr` binary is on your `PATH`.
@@ -91,7 +91,7 @@ herdr-spreader apply [--file <path>]
 
 | Flag | Description |
 |---|---|
-| `-f, --file <path>` | Path to a layout YAML file. If omitted, resolved in order: `HERDR_PLUGIN_CONFIG_DIR/spread.yml` (when run as a plugin) → `~/.config/herdr-spreader/spread.yml`. |
+| `-f, --file <path>` | Path to a layout YAML file. If omitted, resolved in priority order: `$HERDR_PLUGIN_CONFIG_DIR` → `$XDG_CONFIG_HOME/herdr-spreader` → `$HOME/.config/herdr-spreader`. Each directory is searched for `config.yaml` then `config.yml`. |
 
 ## Configuration reference
 

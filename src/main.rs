@@ -13,7 +13,7 @@ fn main() -> anyhow::Result<()> {
 
     let Command::Apply { file } = cli.command;
 
-    let config_path = resolve_config_path(file, &env);
+    let config_path = resolve_config_path(file, &env)?;
     let spread_file = load_config(&config_path)?;
 
     let bin = CliBackend::resolve_bin(&env);

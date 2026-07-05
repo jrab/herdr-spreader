@@ -82,6 +82,8 @@ pub struct WaitFor {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("no config file found")]
+    NotFound,
     #[error("failed to read config file {path}: {source}")]
     Io {
         path: PathBuf,
@@ -96,22 +98,61 @@ pub enum ConfigError {
     },
 }
 
-const CONFIG_FILE_NAME: &str = "spread.yml";
+const CONFIG_FILE_NAMES: &[&str] = &["config.yaml", "config.yml"];
 
-pub fn resolve_config_path(explicit: Option<PathBuf>, env: &BTreeMap<String, String>) -> PathBuf {
+/// Resolve the path to a config file.
+///
+/// If an explicit path is given, it is returned as-is.
+/// Otherwise, candidate paths are tried in priority order:
+/// `$HERDR_PLUGIN_CONFIG_DIR` → `$XDG_CONFIG_HOME` → `$HOME/.config`.
+/// Each directory is checked for `config.yaml` then `config.yml`.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::NotFound`] when no config file is found in any
+/// candidate location.
+pub fn resolve_config_path(
+    explicit: Option<PathBuf>,
+    env: &BTreeMap<String, String>,
+) -> Result<PathBuf, ConfigError> {
     if let Some(path) = explicit {
-        return path;
+        return Ok(path);
     }
 
-    if let Some(plugin_config_dir) = env.get("HERDR_PLUGIN_CONFIG_DIR") {
-        return PathBuf::from(plugin_config_dir).join(CONFIG_FILE_NAME);
+    for candidate in config_candidate_paths(env) {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(ConfigError::NotFound)
+}
+
+fn config_candidate_paths(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let config_names = CONFIG_FILE_NAMES;
+
+    if let Some(plugin_dir) = env.get("HERDR_PLUGIN_CONFIG_DIR") {
+        let dir = PathBuf::from(plugin_dir);
+        for name in config_names {
+            paths.push(dir.join(name));
+        }
+    }
+
+    if let Some(xdg_home) = env.get("XDG_CONFIG_HOME") {
+        let dir = PathBuf::from(xdg_home).join("herdr-spreader");
+        for name in config_names {
+            paths.push(dir.join(name));
+        }
     }
 
     let home = env.get("HOME").map_or("", String::as_str);
-    PathBuf::from(home)
-        .join(".config")
-        .join("herdr-spreader")
-        .join(CONFIG_FILE_NAME)
+    let dir = PathBuf::from(home).join(".config").join("herdr-spreader");
+    for name in config_names {
+        paths.push(dir.join(name));
+    }
+
+    paths
 }
 
 /// Load a [`SpreadFile`] from a YAML file on disk.
@@ -189,6 +230,16 @@ fn expand_tilde(path: &Path, env: &BTreeMap<String, String>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_format_not_found_error_message() {
+        let err = ConfigError::NotFound;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no config file"),
+            "expected 'no config file' in '{msg}'"
+        );
+    }
 
     #[test]
     fn should_parse_two_workspaces_given_multi_workspace_yaml() {
@@ -332,12 +383,12 @@ workspaces:
 
     #[test]
     fn should_include_file_path_in_error_when_config_file_is_missing() {
-        let path = Path::new("/nonexistent/path/to/spread.yml");
+        let path = Path::new("/nonexistent/path/to/config.yaml");
 
         let result = load_config(path);
 
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("/nonexistent/path/to/spread.yml"));
+        assert!(err.to_string().contains("/nonexistent/path/to/config.yaml"));
     }
 
     #[test]
@@ -366,27 +417,132 @@ workspaces:
         let mut env = BTreeMap::new();
         env.insert("HERDR_PLUGIN_CONFIG_DIR".to_string(), "/cfg".to_string());
 
-        let resolved = resolve_config_path(explicit, &env);
+        let resolved = resolve_config_path(explicit, &env).unwrap();
 
         assert_eq!(resolved, PathBuf::from("/tmp/x.yml"));
     }
 
     #[test]
-    fn should_fall_back_to_plugin_config_dir_then_user_config_dir_when_no_explicit_path() {
-        let mut env_with_plugin_dir = BTreeMap::new();
-        env_with_plugin_dir.insert("HERDR_PLUGIN_CONFIG_DIR".to_string(), "/cfg".to_string());
+    fn should_return_plugin_config_yaml_when_it_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-spreader-test-{}-plugin-yaml",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.yaml"), "").unwrap();
 
-        let resolved_with_plugin_dir = resolve_config_path(None, &env_with_plugin_dir);
-        assert_eq!(resolved_with_plugin_dir, PathBuf::from("/cfg/spread.yml"));
-
-        let mut env_with_home_only = BTreeMap::new();
-        env_with_home_only.insert("HOME".to_string(), "/home/demo".to_string());
-
-        let resolved_with_home = resolve_config_path(None, &env_with_home_only);
-        assert_eq!(
-            resolved_with_home,
-            PathBuf::from("/home/demo/.config/herdr-spreader/spread.yml")
+        let mut env = BTreeMap::new();
+        env.insert(
+            "HERDR_PLUGIN_CONFIG_DIR".to_string(),
+            dir.to_string_lossy().to_string(),
         );
+
+        let resolved = resolve_config_path(None, &env).unwrap();
+
+        assert_eq!(resolved, dir.join("config.yaml"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_return_plugin_config_yml_when_only_yml_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-spreader-test-{}-plugin-yml",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.yml"), "").unwrap();
+
+        let mut env = BTreeMap::new();
+        env.insert(
+            "HERDR_PLUGIN_CONFIG_DIR".to_string(),
+            dir.to_string_lossy().to_string(),
+        );
+
+        let resolved = resolve_config_path(None, &env).unwrap();
+
+        assert_eq!(resolved, dir.join("config.yml"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_return_xdg_config_yaml_when_configured() {
+        let xdg_home =
+            std::env::temp_dir().join(format!("herdr-spreader-test-{}-xdg", std::process::id()));
+        let config_dir = xdg_home.join("herdr-spreader");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("config.yaml"), "").unwrap();
+
+        let mut env = BTreeMap::new();
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg_home.to_string_lossy().to_string(),
+        );
+        env.insert("HOME".to_string(), "/home/demo".to_string());
+
+        let resolved = resolve_config_path(None, &env).unwrap();
+
+        assert_eq!(resolved, config_dir.join("config.yaml"));
+        fs::remove_dir_all(&xdg_home).unwrap();
+    }
+
+    #[test]
+    fn should_fall_back_to_home_config_when_xdg_dir_has_no_yaml_or_yml() {
+        let xdg_home = std::env::temp_dir().join(format!(
+            "herdr-spreader-test-{}-xdg-empty",
+            std::process::id()
+        ));
+        let home =
+            std::env::temp_dir().join(format!("herdr-spreader-test-{}-home", std::process::id()));
+        let home_config_dir = home.join(".config").join("herdr-spreader");
+        fs::create_dir_all(&home_config_dir).unwrap();
+        fs::write(home_config_dir.join("config.yaml"), "").unwrap();
+
+        let mut env = BTreeMap::new();
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            xdg_home.to_string_lossy().to_string(),
+        );
+        env.insert("HOME".to_string(), home.to_string_lossy().to_string());
+
+        let resolved = resolve_config_path(None, &env).unwrap();
+
+        assert_eq!(resolved, home_config_dir.join("config.yaml"));
+        fs::remove_dir_all(&xdg_home).unwrap_or_default();
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn should_return_home_config_when_xdg_config_home_is_not_set() {
+        let home = std::env::temp_dir().join(format!(
+            "herdr-spreader-test-{}-home-no-xdg",
+            std::process::id()
+        ));
+        let home_config_dir = home.join(".config").join("herdr-spreader");
+        fs::create_dir_all(&home_config_dir).unwrap();
+        fs::write(home_config_dir.join("config.yaml"), "").unwrap();
+
+        let mut env = BTreeMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().to_string());
+
+        let resolved = resolve_config_path(None, &env).unwrap();
+
+        assert_eq!(resolved, home_config_dir.join("config.yaml"));
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn should_return_not_found_error_when_no_config_file_exists_in_any_location() {
+        let home = std::env::temp_dir().join(format!(
+            "herdr-spreader-test-{}-not-found",
+            std::process::id()
+        ));
+        let mut env = BTreeMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().to_string());
+
+        let result = resolve_config_path(None, &env);
+
+        assert!(matches!(result, Err(ConfigError::NotFound)));
+        fs::remove_dir_all(&home).unwrap_or_default();
     }
 
     #[test]
@@ -566,7 +722,7 @@ workspaces:
 
     #[test]
     fn should_parse_bundled_example_config() {
-        let yaml = include_str!("../examples/spread.yml");
+        let yaml = include_str!("../examples/config.yaml");
 
         let file = SpreadFile::from_str(yaml).unwrap();
 

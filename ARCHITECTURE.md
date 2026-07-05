@@ -30,7 +30,7 @@ main.rs ──▶ backend/cli.rs ──implements──▶ backend/mod.rs
 ## Data flow
 
 ```
-spread.yml (workspaces: list, required)
+config.yaml (workspaces: list, required; config.yml also accepted)
     │  config::load_config → fs::read_to_string + SpreadFile::from_str (serde_yaml_ng)
     ▼
 SpreadFile { workspaces: Vec<Workspace> }  (raw, as written by the user)
