@@ -62,11 +62,19 @@ $ herdr-spreader apply
 ### As a herdr plugin (recommended)
 
 ```bash
-git clone https://github.com/yuk1ty/herdr-spreader.git
-herdr plugin link ./herdr-spreader
+herdr plugin install yuk1ty/herdr-spreader
 ```
 
-This builds the release binary and registers the plugin with herdr. From then on, invoke it from within any herdr workspace:
+This clones the repository, runs `cargo build --release`, and registers the plugin with herdr.
+
+Next, create the plugin's config directory and note where it lives:
+
+```bash
+herdr plugin config-dir herdr-spreader
+# => ~/.config/herdr/plugins/config/herdr-spreader
+```
+
+Place your layout file named `config.yaml` (or `config.yml`) in that directory. The plugin will find it automatically when invoked. From then on, run the layout from within any herdr workspace:
 
 ```bash
 herdr plugin action invoke herdr-spreader.apply
@@ -91,7 +99,7 @@ herdr-spreader apply [--file <path>]
 
 | Flag | Description |
 |---|---|
-| `-f, --file <path>` | Path to a layout YAML file. If omitted, resolved in priority order: `$HERDR_PLUGIN_CONFIG_DIR` → `$XDG_CONFIG_HOME/herdr-spreader` → `$HOME/.config/herdr-spreader`. Each directory is searched for `config.yaml` then `config.yml`. |
+| `-f, --file <path>` | Path to a layout YAML file. If omitted, searched in `$HERDR_PLUGIN_CONFIG_DIR/` (set automatically when run as a herdr plugin), then `$XDG_CONFIG_HOME/herdr-spreader/`, then `$HOME/.config/herdr-spreader/`. Each directory is checked for `config.yaml` then `config.yml`. Run `herdr plugin config-dir herdr-spreader` to see or create the plugin config directory. |
 
 ## Configuration reference
 
