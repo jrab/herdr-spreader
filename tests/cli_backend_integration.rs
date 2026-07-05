@@ -123,7 +123,7 @@ fn should_thread_ids_and_focus_once_across_two_workspaces_against_fake_herdr() {
         "pane run wA:p2 cargo run",
         "workspace create --label demo2 --no-focus",
         "pane run wB:p1 htop",
-        "pane focus wB:p1",
+        "pane focus --pane wB:p1 --direction left",
     ];
 
     assert_eq!(logged_lines, expected_lines);

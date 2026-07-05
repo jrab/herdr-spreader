@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -77,7 +78,14 @@ pub(crate) fn wait_output_args(pane_id: &str, wait: &WaitFor) -> Vec<String> {
 }
 
 pub(crate) fn focus_args(pane_id: &str) -> Vec<String> {
-    vec!["pane".to_string(), "focus".to_string(), pane_id.to_string()]
+    vec![
+        "pane".to_string(),
+        "focus".to_string(),
+        "--pane".to_string(),
+        pane_id.to_string(),
+        "--direction".to_string(),
+        "left".to_string(),
+    ]
 }
 
 pub(crate) fn rename_tab_args(tab_id: &str, label: &str) -> Vec<String> {
@@ -266,6 +274,83 @@ impl CliBackend {
     }
 }
 
+/// Send a `pane.focus` JSON-RPC request over the herdr Unix socket to focus a
+/// pane directly by ID.
+///
+/// This is the semantically correct way to focus a specific pane. The CLI
+/// `pane focus` command only supports directional focus and cannot target a
+/// pane by ID.
+///
+/// # Errors
+///
+/// Returns [`BackendError::Herdr`] if the socket is unavailable, the
+/// connection fails, or the response indicates an error.
+#[cfg(unix)]
+fn focus_pane_via_socket(pane_id: &str) -> Result<(), BackendError> {
+    use std::os::unix::net::UnixStream;
+
+    let socket_path = std::env::var("HERDR_SOCKET_PATH").map_err(|_| BackendError::Herdr {
+        message: "HERDR_SOCKET_PATH not set, cannot use socket API".to_string(),
+    })?;
+
+    let mut stream = UnixStream::connect(&socket_path).map_err(|e| BackendError::Herdr {
+        message: format!("failed to connect to herdr socket at {socket_path}: {e}"),
+    })?;
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "pane.focus",
+        "params": {
+            "pane_id": pane_id,
+        },
+    });
+
+    let mut request_bytes = serde_json::to_vec(&request).map_err(|e| BackendError::Herdr {
+        message: format!("failed to serialize JSON-RPC request: {e}"),
+    })?;
+    request_bytes.push(b'\n');
+
+    stream
+        .write_all(&request_bytes)
+        .map_err(|e| BackendError::Herdr {
+            message: format!("failed to write to herdr socket: {e}"),
+        })?;
+
+    let mut reader = BufReader::new(&stream);
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .map_err(|e| BackendError::Herdr {
+            message: format!("failed to read from herdr socket: {e}"),
+        })?;
+
+    let value: serde_json::Value =
+        serde_json::from_str(&response).map_err(|e| BackendError::Herdr {
+            message: format!("invalid JSON-RPC response: {e}"),
+        })?;
+
+    if let Some(error) = value.get("error") {
+        let msg = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(BackendError::Herdr {
+            message: format!("herdr socket error: {msg}"),
+        });
+    }
+
+    Ok(())
+}
+
+/// Fallback for non-Unix platforms — always delegates to the CLI.
+#[cfg(not(unix))]
+fn focus_pane_via_socket(_pane_id: &str) -> Result<(), BackendError> {
+    Err(BackendError::Herdr {
+        message: "socket focus not supported on this platform".to_string(),
+    })
+}
+
 impl HerdrBackend for CliBackend {
     fn create_workspace(&mut self, opts: &WorkspaceOpts) -> Result<WorkspaceCreated, BackendError> {
         let stdout = self.exec(&workspace_create_args(opts))?;
@@ -302,6 +387,12 @@ impl HerdrBackend for CliBackend {
     }
 
     fn focus_pane(&mut self, pane_id: &str) -> Result<(), BackendError> {
+        // Prefer the socket API — it can focus a pane directly by ID without
+        // needing a direction, and the socket is always available when running
+        // as a herdr plugin.  Fall back to the CLI for standalone usage.
+        if focus_pane_via_socket(pane_id).is_ok() {
+            return Ok(());
+        }
         self.exec(&focus_args(pane_id))?;
         Ok(())
     }
@@ -432,7 +523,10 @@ mod tests {
     fn should_build_focus_argv_with_pane_id() {
         let args = focus_args("wA:p1");
 
-        assert_eq!(args, vec!["pane", "focus", "wA:p1"]);
+        assert_eq!(
+            args,
+            vec!["pane", "focus", "--pane", "wA:p1", "--direction", "left"]
+        );
     }
 
     #[test]
