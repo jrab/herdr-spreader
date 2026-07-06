@@ -87,6 +87,9 @@ or trigger it from herdr's action menu (`Apply layout`).
 ```bash
 cargo build --release
 ./target/release/herdr-spreader apply --file ./config.yaml
+
+# or
+cargo install --path .
 ```
 
 This works outside of a herdr session too, as long as a herdr server is already running (`herdr server` or `brew services start herdr`) and the `herdr` binary is on your `PATH`.
