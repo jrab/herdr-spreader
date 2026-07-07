@@ -17,15 +17,20 @@
 //! own `create_tab` response, and the mid-tab split's `pane run` targets the
 //! pane id returned by `split_pane`, not a fabricated one), the fake herdr
 //! script hands out a fresh workspace id (`wA` then `wB`) per `workspace
-//! create` call, and `engine::apply` calls `focus_pane` exactly once, at the
-//! very end, targeting the second workspace's root pane (since `demo2` sets
-//! workspace-level `focus: true` and has no pane-level focus override).
+//! create` call, and focus is applied via `--focus` on `workspace create`
+//! (since `demo2` sets workspace-level `focus: true` and the first workspace
+//! sets pane-level `focus: true` on its first pane).
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use herdr_spreader::backend::cli::CliBackend;
 use herdr_spreader::config::{Pane, SplitDirection, SpreadFile, Tab, WaitFor, Workspace};
 use herdr_spreader::engine;
+
+/// Serialises integration tests that write to the process-global
+/// `FAKE_HERDR_LOG` env var so they do not race.
+static FAKE_HERDR_LOCK: Mutex<()> = Mutex::new(());
 
 fn fake_herdr_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -94,12 +99,11 @@ fn build_spread_file() -> SpreadFile {
 }
 
 #[test]
-fn should_thread_ids_and_focus_once_across_two_workspaces_against_fake_herdr() {
+fn should_thread_ids_and_apply_focus_via_create_flags_across_two_workspaces_against_fake_herdr() {
+    let _lock = FAKE_HERDR_LOCK.lock().unwrap();
     let log_path = log_path();
     let _ = std::fs::remove_file(&log_path);
 
-    // Safety: this test does not run concurrently with other code in this
-    // process that reads/writes HERDR-related env vars.
     unsafe {
         std::env::set_var("FAKE_HERDR_LOG", &log_path);
     }
@@ -113,7 +117,7 @@ fn should_thread_ids_and_focus_once_across_two_workspaces_against_fake_herdr() {
     let logged_lines: Vec<&str> = log_contents.lines().collect();
 
     let expected_lines = vec![
-        "workspace create --label demo --no-focus",
+        "workspace create --label demo --focus",
         "tab rename wA:t1 editor",
         "pane run wA:p1 nvim",
         "pane split wA:p1 --direction down --ratio 0.3 --no-focus",
@@ -121,9 +125,68 @@ fn should_thread_ids_and_focus_once_across_two_workspaces_against_fake_herdr() {
         "wait output wA:p3 --match Compiling --timeout 10000",
         "tab create --workspace wA --label server --no-focus",
         "pane run wA:p2 cargo run",
-        "workspace create --label demo2 --no-focus",
+        "workspace create --label demo2 --focus",
         "pane run wB:p1 htop",
-        "pane focus --pane wB:p1 --direction left",
+    ];
+
+    assert_eq!(logged_lines, expected_lines);
+
+    let _ = std::fs::remove_file(&log_path);
+}
+
+fn second_pane_log_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fake_herdr_log_second_pane_focus.txt")
+}
+
+fn build_spread_file_with_focus_on_second_pane() -> SpreadFile {
+    SpreadFile {
+        workspaces: vec![Workspace {
+            name: "demo".to_string(),
+            tabs: vec![Tab {
+                label: Some("editor".to_string()),
+                panes: vec![
+                    Pane {
+                        command: Some("nvim".to_string()),
+                        ..Default::default()
+                    },
+                    Pane {
+                        command: Some("lazygit".to_string()),
+                        split: SplitDirection::Right,
+                        focus: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+#[test]
+fn should_focus_second_pane_when_focus_true_is_on_second_pane() {
+    let _lock = FAKE_HERDR_LOCK.lock().unwrap();
+    let log_path = second_pane_log_path();
+    let _ = std::fs::remove_file(&log_path);
+
+    unsafe {
+        std::env::set_var("FAKE_HERDR_LOG", &log_path);
+    }
+
+    let file = build_spread_file_with_focus_on_second_pane();
+    let mut backend = CliBackend::new(fake_herdr_path());
+
+    engine::apply(&file, &mut backend).expect("apply against fake herdr should succeed");
+
+    let log_contents = std::fs::read_to_string(&log_path).expect("fake herdr log should exist");
+    let logged_lines: Vec<&str> = log_contents.lines().collect();
+
+    let expected_lines = vec![
+        "workspace create --label demo --no-focus",
+        "tab rename wA:t1 editor",
+        "pane run wA:p1 nvim",
+        "pane split wA:p1 --direction right --focus",
+        "pane run wA:p3 lazygit",
     ];
 
     assert_eq!(logged_lines, expected_lines);

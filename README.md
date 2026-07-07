@@ -44,7 +44,7 @@ workspaces:
 $ herdr-spreader apply
 ```
 
-...and you get two fully laid-out workspaces: `frontend`, with an `editor` tab running your dev server, and `backend`, with an `editor` tab (your editor plus a live test watcher split underneath it) and a `server` tab running `cargo run` — with focus landing in `backend`, on the pane you marked `focus: true`, once every workspace in the file has been built.
+...and you get two fully laid-out workspaces: `frontend`, with an `editor` tab running your dev server, and `backend`, with an `editor` tab (your editor plus a live test watcher split underneath it) and a `server` tab running `cargo run` — with focus landing in `backend`, on the pane you marked `focus: true`.
 
 ## Features
 
@@ -122,7 +122,7 @@ A layout file has four levels: the **file** (top level), **workspaces**, **tabs*
 | `root` | path | Base working directory for this workspace. Supports `~`. If omitted, defaults to the directory you invoked `herdr-spreader` from (or, when run as a plugin, the workspace/pane you invoked it in — not the plugin's own install directory). |
 | `env` | map of string→string | Environment variables applied to the workspace's root pane. |
 | `tabs` | list of [Tab](#tab) | Tabs to create, in order. |
-| `focus` | boolean | Whether the layout's final focus should land in this workspace, once every workspace in the file has been built. Default: `false`. If no workspace sets `focus: true`, the first workspace is used. If multiple workspaces set `focus: true`, the last one wins. |
+| `focus` | boolean | Whether this workspace should be focused after creation. When `true`, the workspace is created with `--focus` (or the workspace's marked pane receives focus via `--focus` on its split/tab operation). Default: `false`. If no workspace or pane has `focus: true`, the user's current focus is preserved. |
 
 ### Tab
 
@@ -143,7 +143,7 @@ A layout file has four levels: the **file** (top level), **workspaces**, **tabs*
 | `ratio` | float | Size ratio for the split (e.g. `0.3` gives the new pane 30% of the space). |
 | `wait_for.match` | string | Substring to wait for in the pane's output after running `command`, before moving on to the next pane. |
 | `wait_for.timeout_ms` | integer | How long to wait for the match, in milliseconds. |
-| `focus` | boolean | Mark this pane as the focus candidate for its workspace. If no pane in the workspace sets `focus: true`, the workspace's first pane is its candidate. Only the candidate belonging to the workspace that wins the file's top-level `focus` (see [Workspace](#workspace) above) is actually focused, once every workspace in the file has been built. |
+| `focus` | boolean | Mark this pane to receive focus when it is created. When `true`, the pane's creation operation (`pane split` or `tab create`) is called with `--focus`, so the intended pane naturally receives focus during layout building. If no pane in the file has `focus: true`, the user's current focus is preserved. |
 
 Setting `wait_for` on a pane with no `command` is a configuration error and `apply` will fail — there's nothing to wait for output from.
 
@@ -153,15 +153,15 @@ Paths compose top-down: `root` → tab `cwd` → pane `cwd`, each relative overr
 
 ## How it works
 
-`herdr-spreader` doesn't call any private herdr API — it drives the same `herdr` CLI you'd use by hand, repeating steps 1-5 below for each workspace in the file, in order:
+`herdr-spreader` doesn't call any private herdr API — it drives the same `herdr` CLI you'd use by hand, repeating steps 1-5 below for each workspace in the file, in order. Focus is not deferred to a final step; instead, when a pane is marked `focus: true`, its creation operation (`workspace create`, `tab create`, or `pane split`) is called with `--focus`, so the intended pane naturally receives focus during layout building:
 
-1. `herdr workspace create` — creates the workspace and its first tab/pane.
-2. For each subsequent tab, `herdr tab create` — creates a new tab.
-3. For each pane after the first in a tab, `herdr pane split` — splits off a new pane in the requested direction.
+1. `herdr workspace create` — creates the workspace and its first tab/pane (with `--focus` if the first pane or the workspace is marked for focus).
+2. For each subsequent tab, `herdr tab create` — creates a new tab (with `--focus` if the first pane in that tab is marked).
+3. For each pane after the first in a tab, `herdr pane split` — splits off a new pane in the requested direction (with `--focus` if that pane is marked).
 4. `herdr pane run` — runs the configured command in each pane. A tab's or workspace's first pane can't be created with a working directory or environment variables the way split panes can, so `herdr-spreader` prefixes the command with `cd <dir> && export KEY=VAL && ...` for those panes.
 5. `herdr wait output` — for panes with `wait_for`, blocks until the pattern appears before continuing.
 
-Only once every workspace in the file has been built does `herdr-spreader` call `herdr pane focus` — exactly once for the whole file, never once per workspace — landing on the focus candidate (see [Configuration reference](#configuration-reference)) belonging to whichever workspace won: its own `focus: true`, the first workspace by default, or the last workspace to claim `focus: true` if more than one did.
+Every operation explicitly passes either `--focus` or `--no-focus`, so focus behaviour is deterministic: the final focused pane is the last one created with `--focus` (the pane marked `focus: true`, or the last workspace with `focus: true` and no pane-level override).
 
 Everything is threaded through the IDs each herdr command actually returns — nothing is guessed or hardcoded — so the layout is built correctly however herdr happens to number workspaces, tabs, and panes at runtime.
 

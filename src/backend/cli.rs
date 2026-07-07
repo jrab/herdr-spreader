@@ -119,7 +119,9 @@ fn push_env(args: &mut Vec<String>, env: &BTreeMap<String, String>) {
 }
 
 fn push_focus_flag(args: &mut Vec<String>, focus: bool) {
-    if !focus {
+    if focus {
+        args.push("--focus".to_string());
+    } else {
         args.push("--no-focus".to_string());
     }
 }
@@ -526,6 +528,16 @@ mod tests {
         assert_eq!(
             args,
             vec!["pane", "focus", "--pane", "wA:p1", "--direction", "left"]
+        );
+    }
+
+    #[test]
+    fn should_build_focus_argv_with_second_pane_id_always_using_direction_left() {
+        let args = focus_args("wA:p3");
+
+        assert_eq!(
+            args,
+            vec!["pane", "focus", "--pane", "wA:p3", "--direction", "left"]
         );
     }
 

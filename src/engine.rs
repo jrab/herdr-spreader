@@ -74,7 +74,12 @@ pub enum EngineError {
 }
 
 /// Apply the workspace layout described by `file`, creating workspaces, tabs,
-/// and panes, then focusing the appropriate pane.
+/// and panes.
+///
+/// During creation, each `create_workspace`, `create_tab`, and `split_pane`
+/// call passes `focus: true` when the corresponding pane has `focus: true` in
+/// the config, so the intended pane naturally receives focus. No separate
+/// `focus_pane` call is made at the end.
 ///
 /// # Errors
 ///
@@ -82,39 +87,34 @@ pub enum EngineError {
 /// [`EngineError::WaitForWithoutCommand`] if a pane specifies `wait_for`
 /// without a `command`.
 pub fn apply(file: &SpreadFile, backend: &mut dyn HerdrBackend) -> Result<(), EngineError> {
-    let mut chosen: Option<String> = None;
     for ws in &file.workspaces {
-        let focus_pane_id = apply_workspace(ws, backend)?;
-        if ws.focus || chosen.is_none() {
-            chosen = Some(focus_pane_id);
-        }
-    }
-    if let Some(pane_id) = chosen {
-        backend.focus_pane(&pane_id)?;
+        apply_workspace(ws, backend)?;
     }
     Ok(())
 }
 
 /// Apply a single workspace configuration, creating the workspace, its tabs,
-/// and panes, then returning the id of the pane that should receive focus.
+/// and panes. Focus is set during creation via the `focus` flag on
+/// create/split operations when a pane is marked `focus: true`.
 ///
 /// # Errors
 ///
 /// Returns [`EngineError::Backend`] if any backend operation fails, or
 /// [`EngineError::WaitForWithoutCommand`] if a pane specifies `wait_for`
 /// without a `command`.
-pub fn apply_workspace(
-    ws: &Workspace,
-    backend: &mut dyn HerdrBackend,
-) -> Result<String, EngineError> {
+pub fn apply_workspace(ws: &Workspace, backend: &mut dyn HerdrBackend) -> Result<(), EngineError> {
+    let first_pane_focus = ws
+        .tabs
+        .first()
+        .and_then(|t| t.panes.first())
+        .is_some_and(|p| p.focus);
+
     let workspace = backend.create_workspace(&WorkspaceOpts {
         label: ws.name.clone(),
         cwd: ws.root.clone(),
         env: ws.env.clone(),
-        focus: false,
+        focus: ws.focus || first_pane_focus,
     })?;
-
-    let mut focus_pane_id = workspace.root_pane_id.clone();
 
     for (index, tab) in ws.tabs.iter().enumerate() {
         let root_pane_id = if index == 0 {
@@ -123,12 +123,13 @@ pub fn apply_workspace(
             }
             workspace.root_pane_id.clone()
         } else {
+            let first_pane_focus = tab.panes.first().is_some_and(|p| p.focus);
             let created_tab = backend.create_tab(
                 &workspace.workspace_id,
                 &TabOpts {
                     label: tab.label.clone(),
                     cwd: resolve_cwd(ws.root.as_deref(), tab.cwd.as_deref(), None),
-                    focus: false,
+                    focus: first_pane_focus,
                 },
             )?;
             created_tab.root_pane_id
@@ -151,7 +152,7 @@ pub fn apply_workspace(
                             pane.cwd.as_deref(),
                         ),
                         env: pane.env.clone(),
-                        focus: false,
+                        focus: pane.focus,
                     },
                 )?
             };
@@ -191,15 +192,11 @@ pub fn apply_workspace(
                 }
             }
 
-            if pane.focus {
-                focus_pane_id.clone_from(&pane_id);
-            }
-
             previous_pane_id = pane_id;
         }
     }
 
-    Ok(focus_pane_id)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -791,8 +788,8 @@ mod tests {
     }
 
     #[test]
-    fn should_focus_marked_pane_at_end_and_fall_back_to_first_pane_when_none_marked() {
-        let config_with_explicit_focus = Workspace {
+    fn should_pass_focus_to_create_tab_when_pane_has_focus_true_in_non_first_tab() {
+        let ws = Workspace {
             name: "demo".to_string(),
             tabs: vec![
                 Tab {
@@ -815,21 +812,40 @@ mod tests {
             ],
             ..Default::default()
         };
-        let file_with_explicit_focus = SpreadFile {
-            workspaces: vec![config_with_explicit_focus],
+        let file = SpreadFile {
+            workspaces: vec![ws],
         };
         let mut mock = MockBackend::default();
 
-        engine::apply(&file_with_explicit_focus, &mut mock).unwrap();
+        engine::apply(&file, &mut mock).unwrap();
 
+        let create_tab_call = mock
+            .calls
+            .iter()
+            .find(|c| matches!(c, Call::CreateTab { .. }))
+            .expect("create_tab not called");
         assert_eq!(
-            mock.calls.last(),
-            Some(&Call::FocusPane {
-                pane_id: "w1:p2".to_string(),
-            })
+            create_tab_call,
+            &Call::CreateTab {
+                workspace_id: "w1".to_string(),
+                opts: TabOpts {
+                    label: Some("server".to_string()),
+                    cwd: None,
+                    focus: true,
+                },
+            }
         );
+        assert!(
+            !mock
+                .calls
+                .iter()
+                .any(|c| matches!(c, Call::FocusPane { .. }))
+        );
+    }
 
-        let config_without_focus = Workspace {
+    #[test]
+    fn should_use_no_focus_when_no_pane_or_workspace_has_focus_flag() {
+        let ws = Workspace {
             name: "demo".to_string(),
             tabs: vec![Tab {
                 label: None,
@@ -841,23 +857,32 @@ mod tests {
             }],
             ..Default::default()
         };
-        let file_without_focus = SpreadFile {
-            workspaces: vec![config_without_focus],
+        let file = SpreadFile {
+            workspaces: vec![ws],
         };
         let mut mock = MockBackend::default();
 
-        engine::apply(&file_without_focus, &mut mock).unwrap();
+        engine::apply(&file, &mut mock).unwrap();
 
         assert_eq!(
-            mock.calls.last(),
-            Some(&Call::FocusPane {
-                pane_id: "w1:p1".to_string(),
+            mock.calls[0],
+            Call::CreateWorkspace(WorkspaceOpts {
+                label: "demo".to_string(),
+                cwd: None,
+                env: BTreeMap::new(),
+                focus: false,
             })
+        );
+        assert!(
+            !mock
+                .calls
+                .iter()
+                .any(|c| matches!(c, Call::FocusPane { .. }))
         );
     }
 
     #[test]
-    fn should_apply_workspaces_in_order_and_focus_first_workspace_pane_once_when_no_focus_flag() {
+    fn should_create_workspaces_without_focus_when_no_focus_flag_is_set() {
         let ws1 = Workspace {
             name: "alpha".to_string(),
             tabs: vec![Tab {
@@ -914,22 +939,16 @@ mod tests {
             })
         );
 
-        let focus_calls: Vec<&Call> = mock
-            .calls
-            .iter()
-            .filter(|c| matches!(c, Call::FocusPane { .. }))
-            .collect();
-        assert_eq!(focus_calls.len(), 1);
-        assert_eq!(
-            mock.calls.last(),
-            Some(&Call::FocusPane {
-                pane_id: "w1:p1".to_string(),
-            })
+        assert!(
+            !mock
+                .calls
+                .iter()
+                .any(|c| matches!(c, Call::FocusPane { .. }))
         );
     }
 
     #[test]
-    fn should_focus_pane_inside_workspace_marked_focus_true_given_focus_on_second_workspace() {
+    fn should_pass_workspace_focus_and_split_focus_when_workspace_and_pane_both_have_focus() {
         let ws1 = Workspace {
             name: "alpha".to_string(),
             tabs: vec![Tab {
@@ -969,22 +988,58 @@ mod tests {
 
         engine::apply(&file, &mut mock).unwrap();
 
-        let focus_calls: Vec<&Call> = mock
+        let create_workspace_calls: Vec<&Call> = mock
             .calls
             .iter()
-            .filter(|c| matches!(c, Call::FocusPane { .. }))
+            .filter(|c| matches!(c, Call::CreateWorkspace(_)))
             .collect();
-        assert_eq!(focus_calls.len(), 1);
+        assert_eq!(create_workspace_calls.len(), 2);
         assert_eq!(
-            mock.calls.last(),
-            Some(&Call::FocusPane {
-                pane_id: "w2:p2".to_string(),
+            create_workspace_calls[0],
+            &Call::CreateWorkspace(WorkspaceOpts {
+                label: "alpha".to_string(),
+                cwd: None,
+                env: BTreeMap::new(),
+                focus: false,
             })
+        );
+        assert_eq!(
+            create_workspace_calls[1],
+            &Call::CreateWorkspace(WorkspaceOpts {
+                label: "beta".to_string(),
+                cwd: None,
+                env: BTreeMap::new(),
+                focus: true,
+            })
+        );
+
+        let split_call = mock
+            .calls
+            .iter()
+            .find(|c| matches!(c, Call::SplitPane { .. }))
+            .expect("split_pane not called");
+        assert_eq!(
+            split_call,
+            &Call::SplitPane {
+                from: "w2:p1".to_string(),
+                opts: SplitOpts {
+                    direction: SplitDirection::Right,
+                    ratio: None,
+                    focus: true,
+                    ..Default::default()
+                },
+            }
+        );
+        assert!(
+            !mock
+                .calls
+                .iter()
+                .any(|c| matches!(c, Call::FocusPane { .. }))
         );
     }
 
     #[test]
-    fn should_focus_last_workspace_marked_focus_true_when_multiple_workspaces_set_focus() {
+    fn should_pass_focus_to_last_workspace_with_focus_true() {
         let ws1 = Workspace {
             name: "alpha".to_string(),
             focus: true,
@@ -1030,11 +1085,44 @@ mod tests {
 
         engine::apply(&file, &mut mock).unwrap();
 
+        let create_workspace_calls: Vec<&Call> = mock
+            .calls
+            .iter()
+            .filter(|c| matches!(c, Call::CreateWorkspace(_)))
+            .collect();
+        assert_eq!(create_workspace_calls.len(), 3);
         assert_eq!(
-            mock.calls.last(),
-            Some(&Call::FocusPane {
-                pane_id: "w3:p1".to_string(),
+            create_workspace_calls[0],
+            &Call::CreateWorkspace(WorkspaceOpts {
+                label: "alpha".to_string(),
+                cwd: None,
+                env: BTreeMap::new(),
+                focus: true,
             })
+        );
+        assert_eq!(
+            create_workspace_calls[1],
+            &Call::CreateWorkspace(WorkspaceOpts {
+                label: "beta".to_string(),
+                cwd: None,
+                env: BTreeMap::new(),
+                focus: false,
+            })
+        );
+        assert_eq!(
+            create_workspace_calls[2],
+            &Call::CreateWorkspace(WorkspaceOpts {
+                label: "gamma".to_string(),
+                cwd: None,
+                env: BTreeMap::new(),
+                focus: true,
+            })
+        );
+        assert!(
+            !mock
+                .calls
+                .iter()
+                .any(|c| matches!(c, Call::FocusPane { .. }))
         );
     }
 
@@ -1050,7 +1138,61 @@ mod tests {
     }
 
     #[test]
-    fn should_return_marked_focus_pane_id_without_calling_focus_pane_when_applying_one_workspace() {
+    fn should_pass_focus_to_split_pane_when_second_pane_has_focus_true() {
+        let ws = Workspace {
+            name: "demo".to_string(),
+            tabs: vec![Tab {
+                label: Some("editor".to_string()),
+                panes: vec![
+                    Pane {
+                        command: Some("nvim".to_string()),
+                        ..Default::default()
+                    },
+                    Pane {
+                        command: Some("lazygit".to_string()),
+                        split: SplitDirection::Right,
+                        focus: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let file = SpreadFile {
+            workspaces: vec![ws],
+        };
+        let mut mock = MockBackend::default();
+
+        engine::apply(&file, &mut mock).unwrap();
+
+        let split_call = mock
+            .calls
+            .iter()
+            .find(|c| matches!(c, Call::SplitPane { .. }))
+            .expect("split_pane not called");
+        assert_eq!(
+            split_call,
+            &Call::SplitPane {
+                from: "w1:p1".to_string(),
+                opts: SplitOpts {
+                    direction: SplitDirection::Right,
+                    ratio: None,
+                    focus: true,
+                    ..Default::default()
+                },
+            }
+        );
+        assert!(
+            !mock
+                .calls
+                .iter()
+                .any(|c| matches!(c, Call::FocusPane { .. }))
+        );
+    }
+
+    #[test]
+    fn should_pass_focus_to_split_pane_when_pane_has_focus_true_without_calling_focus_pane() {
         let ws = Workspace {
             name: "demo".to_string(),
             tabs: vec![Tab {
@@ -1072,9 +1214,20 @@ mod tests {
         };
         let mut mock = MockBackend::default();
 
-        let id = engine::apply_workspace(&ws, &mut mock).unwrap();
+        engine::apply_workspace(&ws, &mut mock).unwrap();
 
-        assert_eq!(id, "w1:p2");
+        assert_eq!(
+            mock.calls[1],
+            Call::SplitPane {
+                from: "w1:p1".to_string(),
+                opts: SplitOpts {
+                    direction: SplitDirection::Right,
+                    ratio: None,
+                    focus: true,
+                    ..Default::default()
+                },
+            }
+        );
         assert!(
             !mock
                 .calls
