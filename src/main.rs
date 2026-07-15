@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use clap::Parser;
 
@@ -13,7 +14,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Apply { file } => {
+        Command::Apply { file, dry_run } => {
             let config_path = resolve_config_path(file, &env)?;
             let contents = read_config(&config_path)?;
             let spread_file = match validate::validate_config(validate::SourceFile {
@@ -28,7 +29,8 @@ fn main() -> anyhow::Result<()> {
             };
 
             let bin = CliBackend::resolve_bin(&env);
-            let mut backend = CliBackend::new(bin);
+            let socket_path = env.get("HERDR_SOCKET_PATH").map(PathBuf::from);
+            let mut backend = CliBackend::new(bin, socket_path);
 
             let cwd = match env
                 .get("HERDR_PANE_ID")
@@ -37,7 +39,15 @@ fn main() -> anyhow::Result<()> {
                 Some(cwd) => cwd,
                 None => std::env::current_dir()?,
             };
-            let spread_file = resolve_paths(spread_file, &env, &cwd);
+            let spread_file = resolve_paths(&spread_file, &env, &cwd);
+
+            if dry_run {
+                let plan = engine::plan_file(&spread_file);
+                for op in &plan {
+                    println!("{}", engine::render_op(op));
+                }
+                return Ok(());
+            }
 
             engine::apply(&spread_file, &mut backend)?;
 
