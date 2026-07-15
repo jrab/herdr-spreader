@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::fmt::Write;
 use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
 use crate::backend::{BackendError, HerdrBackend, SplitOpts, TabOpts, WorkspaceOpts};
-use crate::config::{SpreadFile, Workspace};
+use crate::config::{SplitDirection, SpreadFile, WaitFor, Workspace};
 
 fn resolve_cwd(
     root: Option<&Path>,
@@ -65,10 +67,109 @@ fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PaneHandle {
+    TabRoot(usize),
+    Split(usize),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackendOp {
+    CreateWorkspace(WorkspaceOpts),
+    RenameFirstTab {
+        label: String,
+    },
+    CreateTab {
+        index: usize,
+        opts: TabOpts,
+    },
+    SplitPane {
+        from: PaneHandle,
+        into: PaneHandle,
+        opts: SplitOpts,
+    },
+    Run {
+        pane: PaneHandle,
+        command: String,
+    },
+    WaitOutput {
+        pane: PaneHandle,
+        wait: WaitFor,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error(transparent)]
     Backend(#[from] BackendError),
+}
+
+#[derive(Default)]
+struct Executor {
+    workspace_id: Option<String>,
+    tab0_id: Option<String>,
+    panes: HashMap<PaneHandle, String>,
+}
+
+/// Execute a plan of backend operations, threading the real ids returned by the
+/// backend into the panes referenced by later operations.
+///
+/// # Errors
+///
+/// Returns [`EngineError::Backend`] if any backend operation fails.
+///
+/// # Panics
+///
+/// Panics if the plan orders operations such that a handle or workspace/tab id
+/// is used before it is produced (for example, `RenameFirstTab` before
+/// `CreateWorkspace`).
+pub fn execute_plan(plan: &[BackendOp], backend: &mut dyn HerdrBackend) -> Result<(), EngineError> {
+    let mut ex = Executor::default();
+    for op in plan {
+        match op {
+            BackendOp::CreateWorkspace(opts) => {
+                let c = backend.create_workspace(opts)?;
+                ex.workspace_id = Some(c.workspace_id);
+                ex.tab0_id = Some(c.tab_id);
+                ex.panes.insert(PaneHandle::TabRoot(0), c.root_pane_id);
+            }
+            BackendOp::RenameFirstTab { label } => {
+                backend.rename_tab(
+                    ex.tab0_id
+                        .as_ref()
+                        .expect("RenameFirstTab before CreateWorkspace"),
+                    label,
+                )?;
+            }
+            BackendOp::CreateTab { index, opts } => {
+                let c = backend.create_tab(
+                    ex.workspace_id
+                        .as_ref()
+                        .expect("CreateTab before CreateWorkspace"),
+                    opts,
+                )?;
+                ex.panes.insert(PaneHandle::TabRoot(*index), c.root_pane_id);
+            }
+            BackendOp::SplitPane { from, into, opts } => {
+                let src = ex
+                    .panes
+                    .get(from)
+                    .expect("SplitPane from unknown handle")
+                    .clone();
+                let new_id = backend.split_pane(&src, opts)?;
+                ex.panes.insert(into.clone(), new_id);
+            }
+            BackendOp::Run { pane, command } => {
+                let id = ex.panes.get(pane).expect("Run unknown handle");
+                backend.run(id, command)?;
+            }
+            BackendOp::WaitOutput { pane, wait } => {
+                let id = ex.panes.get(pane).expect("Wait unknown handle");
+                backend.wait_output(id, wait)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Apply the workspace layout described by `file`, creating workspaces, tabs,
@@ -83,61 +184,60 @@ pub enum EngineError {
 ///
 /// Returns [`EngineError::Backend`] if any backend operation fails.
 pub fn apply(file: &SpreadFile, backend: &mut dyn HerdrBackend) -> Result<(), EngineError> {
-    for ws in &file.workspaces {
-        apply_workspace(ws, backend)?;
-    }
-    Ok(())
+    execute_plan(&plan_file(file), backend)
 }
 
-/// Apply a single workspace configuration, creating the workspace, its tabs,
-/// and panes. Focus is set during creation via the `focus` flag on
-/// create/split operations when a pane is marked `focus: true`.
-///
-/// # Errors
-///
-/// Returns [`EngineError::Backend`] if any backend operation fails.
-pub fn apply_workspace(ws: &Workspace, backend: &mut dyn HerdrBackend) -> Result<(), EngineError> {
+#[must_use]
+pub fn plan_workspace(ws: &Workspace) -> Vec<BackendOp> {
     let first_pane_focus = ws
         .tabs
         .first()
         .and_then(|t| t.panes.first())
         .is_some_and(|p| p.focus);
 
-    let workspace = backend.create_workspace(&WorkspaceOpts {
+    let mut ops = Vec::new();
+    ops.push(BackendOp::CreateWorkspace(WorkspaceOpts {
         label: ws.name.clone(),
         cwd: ws.root.clone(),
         env: ws.env.clone(),
         focus: ws.focus || first_pane_focus,
-    })?;
+    }));
 
-    for (index, tab) in ws.tabs.iter().enumerate() {
-        let root_pane_id = if index == 0 {
+    let mut next_split = 1usize;
+
+    for (tab_index, tab) in ws.tabs.iter().enumerate() {
+        let root_handle = PaneHandle::TabRoot(tab_index);
+
+        if tab_index == 0 {
             if let Some(label) = &tab.label {
-                backend.rename_tab(&workspace.tab_id, label)?;
+                ops.push(BackendOp::RenameFirstTab {
+                    label: label.clone(),
+                });
             }
-            workspace.root_pane_id.clone()
         } else {
             let first_pane_focus = tab.panes.first().is_some_and(|p| p.focus);
-            let created_tab = backend.create_tab(
-                &workspace.workspace_id,
-                &TabOpts {
+            ops.push(BackendOp::CreateTab {
+                index: tab_index,
+                opts: TabOpts {
                     label: tab.label.clone(),
                     cwd: resolve_cwd(ws.root.as_deref(), tab.cwd.as_deref(), None),
                     focus: first_pane_focus,
                 },
-            )?;
-            created_tab.root_pane_id
-        };
+            });
+        }
 
-        let mut previous_pane_id = root_pane_id;
+        let mut previous_handle = root_handle;
 
         for (pane_index, pane) in tab.panes.iter().enumerate() {
-            let pane_id = if pane_index == 0 {
-                previous_pane_id.clone()
+            let pane_handle = if pane_index == 0 {
+                previous_handle.clone()
             } else {
-                backend.split_pane(
-                    &previous_pane_id,
-                    &SplitOpts {
+                let new_handle = PaneHandle::Split(next_split);
+                next_split += 1;
+                ops.push(BackendOp::SplitPane {
+                    from: previous_handle.clone(),
+                    into: new_handle.clone(),
+                    opts: SplitOpts {
                         direction: pane.split,
                         ratio: pane.ratio,
                         cwd: resolve_cwd(
@@ -148,15 +248,11 @@ pub fn apply_workspace(ws: &Workspace, backend: &mut dyn HerdrBackend) -> Result
                         env: pane.env.clone(),
                         focus: pane.focus,
                     },
-                )?
+                });
+                new_handle
             };
 
-            // Tab index 0's pane 0 reuses the workspace's root pane (already at
-            // `ws.root`); later tabs' pane 0 reuses the tab's root pane (already
-            // resolved against `tab.cwd` in `create_tab` above). Only emit a `cd`
-            // when a pane-level override (or, for the first tab, a tab-level
-            // override) asks for something beyond that baseline.
-            let needs_cwd_override = pane.cwd.is_some() || (index == 0 && tab.cwd.is_some());
+            let needs_cwd_override = pane.cwd.is_some() || (tab_index == 0 && tab.cwd.is_some());
             let resolved_cwd = if pane_index == 0 && needs_cwd_override {
                 resolve_cwd(ws.root.as_deref(), tab.cwd.as_deref(), pane.cwd.as_deref())
             } else {
@@ -169,23 +265,117 @@ pub fn apply_workspace(ws: &Workspace, backend: &mut dyn HerdrBackend) -> Result
                 } else {
                     command.clone()
                 };
-
-                backend.run(&pane_id, &command_to_run)?;
-
+                ops.push(BackendOp::Run {
+                    pane: pane_handle.clone(),
+                    command: command_to_run,
+                });
                 if let Some(wait_for) = &pane.wait_for {
-                    backend.wait_output(&pane_id, wait_for)?;
+                    ops.push(BackendOp::WaitOutput {
+                        pane: pane_handle.clone(),
+                        wait: wait_for.clone(),
+                    });
                 }
             } else if pane_index == 0
                 && let Some(prefix) = cwd_env_prefix(resolved_cwd.as_deref(), &pane.env)
             {
-                backend.run(&pane_id, &prefix)?;
+                ops.push(BackendOp::Run {
+                    pane: pane_handle.clone(),
+                    command: prefix,
+                });
             }
 
-            previous_pane_id = pane_id;
+            previous_handle = pane_handle;
         }
     }
 
-    Ok(())
+    ops
+}
+
+#[must_use]
+pub fn plan_file(file: &SpreadFile) -> Vec<BackendOp> {
+    file.workspaces.iter().flat_map(plan_workspace).collect()
+}
+
+#[must_use]
+pub fn render_op(op: &BackendOp) -> String {
+    let mut s = String::new();
+    match op {
+        BackendOp::CreateWorkspace(opts) => {
+            write!(s, "workspace create --label {}", shell_quote(&opts.label)).unwrap();
+            if let Some(cwd) = &opts.cwd {
+                write!(s, " --cwd {}", cwd.display()).unwrap();
+            }
+            for (k, v) in &opts.env {
+                write!(s, " --env {k}={}", shell_quote(v)).unwrap();
+            }
+            s.push_str(if opts.focus {
+                " --focus"
+            } else {
+                " --no-focus"
+            });
+        }
+        BackendOp::RenameFirstTab { label } => {
+            write!(s, "tab rename --label {}", shell_quote(label)).unwrap();
+        }
+        BackendOp::CreateTab { index, opts } => {
+            write!(s, "tab create --index {index}").unwrap();
+            if let Some(label) = &opts.label {
+                write!(s, " --label {}", shell_quote(label)).unwrap();
+            }
+            if let Some(cwd) = &opts.cwd {
+                write!(s, " --cwd {}", cwd.display()).unwrap();
+            }
+            s.push_str(if opts.focus {
+                " --focus"
+            } else {
+                " --no-focus"
+            });
+        }
+        BackendOp::SplitPane { from, into, opts } => {
+            write!(
+                s,
+                "pane split {from:?} -> {into:?} --direction {}",
+                direction_str(opts.direction)
+            )
+            .unwrap();
+            if let Some(ratio) = opts.ratio {
+                write!(s, " --ratio {ratio}").unwrap();
+            }
+            if let Some(cwd) = &opts.cwd {
+                write!(s, " --cwd {}", cwd.display()).unwrap();
+            }
+            for (k, v) in &opts.env {
+                write!(s, " --env {k}={}", shell_quote(v)).unwrap();
+            }
+            s.push_str(if opts.focus {
+                " --focus"
+            } else {
+                " --no-focus"
+            });
+        }
+        BackendOp::Run { pane, command } => {
+            write!(s, "pane run {pane:?} {command}").unwrap();
+        }
+        BackendOp::WaitOutput { pane, wait } => {
+            write!(
+                s,
+                "wait output {pane:?} --match {}",
+                shell_quote(&wait.pattern)
+            )
+            .unwrap();
+            if let Some(timeout) = wait.timeout_ms {
+                write!(s, " --timeout {timeout}").unwrap();
+            }
+        }
+    }
+    s
+}
+
+fn direction_str(d: SplitDirection) -> &'static str {
+    match d {
+        SplitDirection::Right => "right",
+        SplitDirection::Down => "down",
+    }
 }
 
 #[cfg(test)]
@@ -199,41 +389,32 @@ mod tests {
     use crate::config::{Pane, SplitDirection, SpreadFile, Tab, WaitFor, Workspace};
     use crate::engine;
 
-    #[derive(Debug, PartialEq)]
-    enum Call {
-        CreateWorkspace(WorkspaceOpts),
-        RenameTab { tab_id: String, label: String },
-        CreateTab { workspace_id: String, opts: TabOpts },
-        SplitPane { from: String, opts: SplitOpts },
-        Run { pane_id: String, command: String },
-        WaitOutput { pane_id: String, wait: WaitFor },
-        FocusPane { pane_id: String },
-    }
-
     #[derive(Default)]
-    struct MockBackend {
-        calls: Vec<Call>,
-        next_workspace: u32,
-        current_ws: String,
-        next_tab: u32,
+    struct RecordingBackend {
+        log: Vec<String>,
         next_pane: u32,
     }
 
-    impl HerdrBackend for MockBackend {
+    impl HerdrBackend for RecordingBackend {
         fn create_workspace(
             &mut self,
             opts: &WorkspaceOpts,
         ) -> Result<WorkspaceCreated, BackendError> {
-            self.calls.push(Call::CreateWorkspace(opts.clone()));
-            self.next_workspace += 1;
-            self.current_ws = format!("w{}", self.next_workspace);
-            self.next_tab = 2;
+            self.log.push(format!(
+                "create_workspace label={} focus={}",
+                opts.label, opts.focus
+            ));
             self.next_pane = 2;
             Ok(WorkspaceCreated {
-                workspace_id: self.current_ws.clone(),
-                tab_id: format!("{}:t1", self.current_ws),
-                root_pane_id: format!("{}:p1", self.current_ws),
+                workspace_id: "w1".into(),
+                tab_id: "w1:t1".into(),
+                root_pane_id: "w1:p1".into(),
             })
+        }
+
+        fn rename_tab(&mut self, tab_id: &str, label: &str) -> Result<(), BackendError> {
+            self.log.push(format!("rename_tab {tab_id} -> {label}"));
+            Ok(())
         }
 
         fn create_tab(
@@ -241,959 +422,1376 @@ mod tests {
             workspace_id: &str,
             opts: &TabOpts,
         ) -> Result<TabCreated, BackendError> {
-            self.calls.push(Call::CreateTab {
-                workspace_id: workspace_id.to_string(),
-                opts: opts.clone(),
-            });
-            let tab_id = format!("{workspace_id}:t{}", self.next_tab);
-            let pane_id = format!("{workspace_id}:p{}", self.next_pane);
-            self.next_tab += 1;
+            let p = format!("{workspace_id}:p{}", self.next_pane);
             self.next_pane += 1;
+            self.log.push(format!(
+                "create_tab ws={workspace_id} label={:?} cwd={:?}",
+                opts.label, opts.cwd
+            ));
             Ok(TabCreated {
-                tab_id,
-                root_pane_id: pane_id,
+                tab_id: format!("{workspace_id}:t2"),
+                root_pane_id: p,
             })
         }
 
-        fn split_pane(
-            &mut self,
-            from_pane: &str,
-            opts: &SplitOpts,
-        ) -> Result<String, BackendError> {
-            self.calls.push(Call::SplitPane {
-                from: from_pane.to_string(),
-                opts: opts.clone(),
-            });
-            let pane_id = format!("{}:p{}", self.current_ws, self.next_pane);
+        fn split_pane(&mut self, from: &str, opts: &SplitOpts) -> Result<String, BackendError> {
+            let p = format!("w1:p{}", self.next_pane);
             self.next_pane += 1;
-            Ok(pane_id)
+            self.log.push(format!(
+                "split_pane from={from} -> {p} dir={:?} focus={}",
+                opts.direction, opts.focus
+            ));
+            Ok(p)
         }
 
         fn run(&mut self, pane_id: &str, command: &str) -> Result<(), BackendError> {
-            self.calls.push(Call::Run {
-                pane_id: pane_id.to_string(),
-                command: command.to_string(),
-            });
-            Ok(())
-        }
-
-        fn rename_tab(&mut self, tab_id: &str, label: &str) -> Result<(), BackendError> {
-            self.calls.push(Call::RenameTab {
-                tab_id: tab_id.to_string(),
-                label: label.to_string(),
-            });
+            self.log.push(format!("run {pane_id} {command}"));
             Ok(())
         }
 
         fn wait_output(&mut self, pane_id: &str, wait: &WaitFor) -> Result<(), BackendError> {
-            self.calls.push(Call::WaitOutput {
-                pane_id: pane_id.to_string(),
-                wait: wait.clone(),
-            });
+            self.log
+                .push(format!("wait_output {pane_id} pattern={}", wait.pattern));
             Ok(())
         }
 
-        fn focus_pane(&mut self, pane_id: &str) -> Result<(), BackendError> {
-            self.calls.push(Call::FocusPane {
-                pane_id: pane_id.to_string(),
-            });
-            Ok(())
+        fn focus_pane(&mut self, _pane_id: &str) -> Result<(), BackendError> {
+            unreachable!("execute_plan must never call focus_pane")
         }
     }
 
-    #[test]
-    fn should_create_workspace_with_label_cwd_and_no_focus_given_minimal_config() {
-        let config = Workspace {
-            name: "demo".to_string(),
-            root: Some(PathBuf::from("/proj")),
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
+    mod execute_tests {
+        use super::*;
+        use crate::engine::{BackendOp, PaneHandle};
 
-        engine::apply_workspace(&config, &mut mock).unwrap();
-
-        assert_eq!(
-            mock.calls[0],
-            Call::CreateWorkspace(WorkspaceOpts {
-                label: "demo".to_string(),
-                cwd: Some(PathBuf::from("/proj")),
-                env: BTreeMap::new(),
-                focus: false,
-            })
-        );
-    }
-
-    #[test]
-    fn should_run_command_in_root_pane_given_single_tab_with_one_pane() {
-        let config = Workspace {
-            name: "demo".to_string(),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![Pane {
-                    command: Some("nvim".to_string()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply_workspace(&config, &mut mock).unwrap();
-
-        assert_eq!(
-            mock.calls[1],
-            Call::Run {
-                pane_id: "w1:p1".to_string(),
-                command: "nvim".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn should_rename_root_tab_when_first_tab_has_label() {
-        let config = Workspace {
-            name: "demo".to_string(),
-            tabs: vec![Tab {
-                label: Some("editor".to_string()),
-                panes: vec![Pane {
-                    command: Some("nvim".to_string()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply_workspace(&config, &mut mock).unwrap();
-
-        let rename_index = mock
-            .calls
-            .iter()
-            .position(|c| matches!(c, Call::RenameTab { .. }))
-            .expect("rename_tab was not called");
-        let run_index = mock
-            .calls
-            .iter()
-            .position(|c| matches!(c, Call::Run { .. }))
-            .expect("run was not called");
-
-        assert_eq!(
-            mock.calls[rename_index],
-            Call::RenameTab {
-                tab_id: "w1:t1".to_string(),
-                label: "editor".to_string(),
-            }
-        );
-        assert!(rename_index < run_index);
-    }
-
-    #[test]
-    fn should_create_additional_tab_threading_workspace_id_given_second_tab() {
-        let config = Workspace {
-            name: "demo".to_string(),
-            tabs: vec![
-                Tab {
-                    label: None,
-                    panes: vec![Pane {
-                        command: None,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                Tab {
-                    label: Some("server".to_string()),
-                    panes: vec![Pane {
-                        command: Some("cargo run".to_string()),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply_workspace(&config, &mut mock).unwrap();
-
-        let create_tab_index = mock
-            .calls
-            .iter()
-            .position(|c| matches!(c, Call::CreateTab { .. }))
-            .expect("create_tab was not called");
-
-        assert_eq!(
-            mock.calls[create_tab_index],
-            Call::CreateTab {
-                workspace_id: "w1".to_string(),
-                opts: TabOpts {
-                    label: Some("server".to_string()),
+        #[test]
+        fn should_execute_create_workspace_and_run_calls_in_plan_order_threading_ids_from_backend()
+        {
+            let plan = vec![
+                BackendOp::CreateWorkspace(WorkspaceOpts {
+                    label: "demo".into(),
                     cwd: None,
+                    env: BTreeMap::new(),
                     focus: false,
+                }),
+                BackendOp::Run {
+                    pane: PaneHandle::TabRoot(0),
+                    command: "nvim".into(),
                 },
-            }
-        );
-        assert_eq!(
-            mock.calls[create_tab_index + 1],
-            Call::Run {
-                pane_id: "w1:p2".to_string(),
-                command: "cargo run".to_string(),
-            }
-        );
-    }
+            ];
+            let mut rec = RecordingBackend::default();
+            engine::execute_plan(&plan, &mut rec).unwrap();
+            assert_eq!(
+                rec.log,
+                vec![
+                    "create_workspace label=demo focus=false".to_string(),
+                    "run w1:p1 nvim".to_string(),
+                ]
+            );
+        }
 
-    #[test]
-    fn should_split_from_previous_pane_with_direction_and_ratio_given_multi_pane_tab() {
-        let config = Workspace {
-            name: "demo".to_string(),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![
-                    Pane {
-                        command: None,
-                        ..Default::default()
-                    },
-                    Pane {
-                        command: Some("watch".to_string()),
-                        split: SplitDirection::Down,
-                        ratio: Some(0.3),
-                        ..Default::default()
-                    },
-                    Pane {
-                        command: Some("logs".to_string()),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply_workspace(&config, &mut mock).unwrap();
-
-        assert_eq!(
-            mock.calls[1],
-            Call::SplitPane {
-                from: "w1:p1".to_string(),
-                opts: SplitOpts {
-                    direction: SplitDirection::Down,
-                    ratio: Some(0.3),
-                    ..Default::default()
-                },
-            }
-        );
-        assert_eq!(
-            mock.calls[2],
-            Call::Run {
-                pane_id: "w1:p2".to_string(),
-                command: "watch".to_string(),
-            }
-        );
-        assert_eq!(
-            mock.calls[3],
-            Call::SplitPane {
-                from: "w1:p2".to_string(),
-                opts: SplitOpts {
-                    direction: SplitDirection::Right,
-                    ratio: None,
-                    ..Default::default()
-                },
-            }
-        );
-        assert_eq!(
-            mock.calls[4],
-            Call::Run {
-                pane_id: "w1:p3".to_string(),
-                command: "logs".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn should_pass_pane_cwd_and_env_to_split_opts_given_pane_overrides() {
-        let mut pane_env = BTreeMap::new();
-        pane_env.insert("FOO".to_string(), "bar".to_string());
-
-        let config = Workspace {
-            name: "demo".to_string(),
-            root: Some(PathBuf::from("/proj")),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![
-                    Pane {
-                        command: None,
-                        ..Default::default()
-                    },
-                    Pane {
-                        command: Some("watch".to_string()),
-                        cwd: Some(PathBuf::from("./sub")),
-                        env: pane_env.clone(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply_workspace(&config, &mut mock).unwrap();
-
-        assert_eq!(
-            mock.calls[1],
-            Call::SplitPane {
-                from: "w1:p1".to_string(),
-                opts: SplitOpts {
-                    direction: SplitDirection::Right,
-                    ratio: None,
-                    cwd: Some(PathBuf::from("/proj/sub")),
-                    env: pane_env,
-                    focus: false,
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn should_call_wait_output_after_run_and_before_next_pane_given_wait_for() {
-        let config = Workspace {
-            name: "demo".to_string(),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![
-                    Pane {
-                        command: Some("watch".to_string()),
-                        wait_for: Some(WaitFor {
-                            pattern: "ready".to_string(),
-                            timeout_ms: None,
-                        }),
-                        ..Default::default()
-                    },
-                    Pane {
-                        command: Some("logs".to_string()),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply_workspace(&config, &mut mock).unwrap();
-
-        assert_eq!(
-            mock.calls[1],
-            Call::Run {
-                pane_id: "w1:p1".to_string(),
-                command: "watch".to_string(),
-            }
-        );
-        assert_eq!(
-            mock.calls[2],
-            Call::WaitOutput {
-                pane_id: "w1:p1".to_string(),
-                wait: WaitFor {
-                    pattern: "ready".to_string(),
-                    timeout_ms: None,
-                },
-            }
-        );
-        assert_eq!(
-            mock.calls[3],
-            Call::SplitPane {
-                from: "w1:p1".to_string(),
-                opts: SplitOpts {
-                    direction: SplitDirection::Right,
-                    ratio: None,
-                    ..Default::default()
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn should_wrap_first_pane_command_with_cd_and_env_export_given_root_tab_and_pane_overrides() {
-        let mut pane_env = BTreeMap::new();
-        pane_env.insert("FOO".to_string(), "bar".to_string());
-
-        let config = Workspace {
-            name: "demo".to_string(),
-            root: Some(PathBuf::from("/proj")),
-            tabs: vec![Tab {
-                label: None,
-                cwd: Some(PathBuf::from("./sub")),
-                panes: vec![Pane {
-                    command: Some("nvim".to_string()),
-                    cwd: Some(PathBuf::from("./inner")),
-                    env: pane_env,
-                    ..Default::default()
-                }],
-            }],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply_workspace(&config, &mut mock).unwrap();
-
-        assert_eq!(
-            mock.calls[1],
-            Call::Run {
-                pane_id: "w1:p1".to_string(),
-                command: "cd '/proj/sub/inner' && export FOO='bar' && nvim".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn should_run_bare_cd_and_export_on_first_pane_given_no_command_but_cwd_and_env_set() {
-        let mut pane_env = BTreeMap::new();
-        pane_env.insert("FOO".to_string(), "bar".to_string());
-
-        let config = Workspace {
-            name: "demo".to_string(),
-            root: Some(PathBuf::from("/proj")),
-            tabs: vec![Tab {
-                label: None,
-                cwd: Some(PathBuf::from("./sub")),
-                panes: vec![Pane {
-                    command: None,
-                    env: pane_env,
-                    ..Default::default()
-                }],
-            }],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply_workspace(&config, &mut mock).unwrap();
-
-        assert_eq!(
-            mock.calls[1],
-            Call::Run {
-                pane_id: "w1:p1".to_string(),
-                command: "cd '/proj/sub' && export FOO='bar'".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn should_not_call_run_on_first_pane_given_no_command_and_no_cwd_or_env() {
-        let config = Workspace {
-            name: "demo".to_string(),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![Pane {
-                    command: None,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply_workspace(&config, &mut mock).unwrap();
-
-        assert!(!mock.calls.iter().any(|c| matches!(c, Call::Run { .. })));
-    }
-
-    #[test]
-    fn should_resolve_tab_cwd_against_root_given_second_tab_with_relative_cwd() {
-        let config = Workspace {
-            name: "demo".to_string(),
-            root: Some(PathBuf::from("/proj")),
-            tabs: vec![
-                Tab {
-                    label: None,
-                    panes: vec![Pane {
-                        command: None,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                Tab {
-                    label: Some("server".to_string()),
-                    cwd: Some(PathBuf::from("./svc")),
-                    panes: vec![Pane {
-                        command: Some("cargo run".to_string()),
-                        ..Default::default()
-                    }],
-                },
-            ],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply_workspace(&config, &mut mock).unwrap();
-
-        let create_tab_index = mock
-            .calls
-            .iter()
-            .position(|c| matches!(c, Call::CreateTab { .. }))
-            .expect("create_tab was not called");
-
-        assert_eq!(
-            mock.calls[create_tab_index],
-            Call::CreateTab {
-                workspace_id: "w1".to_string(),
-                opts: TabOpts {
-                    label: Some("server".to_string()),
-                    cwd: Some(PathBuf::from("/proj/svc")),
-                    focus: false,
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn should_pass_focus_to_create_tab_when_pane_has_focus_true_in_non_first_tab() {
-        let ws = Workspace {
-            name: "demo".to_string(),
-            tabs: vec![
-                Tab {
-                    label: None,
-                    panes: vec![Pane {
-                        command: None,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                Tab {
-                    label: Some("server".to_string()),
-                    panes: vec![Pane {
-                        command: Some("cargo run".to_string()),
-                        focus: true,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let file = SpreadFile {
-            workspaces: vec![ws],
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply(&file, &mut mock).unwrap();
-
-        let create_tab_call = mock
-            .calls
-            .iter()
-            .find(|c| matches!(c, Call::CreateTab { .. }))
-            .expect("create_tab not called");
-        assert_eq!(
-            create_tab_call,
-            &Call::CreateTab {
-                workspace_id: "w1".to_string(),
-                opts: TabOpts {
-                    label: Some("server".to_string()),
+        #[test]
+        fn should_thread_root_pane_id_from_create_workspace_into_a_run_on_tabroot_zero() {
+            let plan = vec![
+                BackendOp::CreateWorkspace(WorkspaceOpts {
+                    label: "demo".into(),
                     cwd: None,
-                    focus: true,
+                    env: BTreeMap::new(),
+                    focus: false,
+                }),
+                BackendOp::Run {
+                    pane: PaneHandle::TabRoot(0),
+                    command: "nvim".into(),
                 },
-            }
-        );
-        assert!(
-            !mock
-                .calls
-                .iter()
-                .any(|c| matches!(c, Call::FocusPane { .. }))
-        );
-    }
+            ];
+            let mut rec = RecordingBackend::default();
+            engine::execute_plan(&plan, &mut rec).unwrap();
+            assert_eq!(
+                rec.log,
+                vec![
+                    "create_workspace label=demo focus=false".to_string(),
+                    "run w1:p1 nvim".to_string(),
+                ]
+            );
+        }
 
-    #[test]
-    fn should_use_no_focus_when_no_pane_or_workspace_has_focus_flag() {
-        let ws = Workspace {
-            name: "demo".to_string(),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![Pane {
-                    command: Some("nvim".to_string()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let file = SpreadFile {
-            workspaces: vec![ws],
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply(&file, &mut mock).unwrap();
-
-        assert_eq!(
-            mock.calls[0],
-            Call::CreateWorkspace(WorkspaceOpts {
-                label: "demo".to_string(),
-                cwd: None,
-                env: BTreeMap::new(),
-                focus: false,
-            })
-        );
-        assert!(
-            !mock
-                .calls
-                .iter()
-                .any(|c| matches!(c, Call::FocusPane { .. }))
-        );
-    }
-
-    #[test]
-    fn should_create_workspaces_without_focus_when_no_focus_flag_is_set() {
-        let ws1 = Workspace {
-            name: "alpha".to_string(),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![Pane {
-                    command: Some("nvim".to_string()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let ws2 = Workspace {
-            name: "beta".to_string(),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![Pane {
-                    command: Some("cargo run".to_string()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let file = SpreadFile {
-            workspaces: vec![ws1, ws2],
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply(&file, &mut mock).unwrap();
-
-        let create_workspace_calls: Vec<&Call> = mock
-            .calls
-            .iter()
-            .filter(|c| matches!(c, Call::CreateWorkspace(_)))
-            .collect();
-        assert_eq!(create_workspace_calls.len(), 2);
-        assert_eq!(
-            create_workspace_calls[0],
-            &Call::CreateWorkspace(WorkspaceOpts {
-                label: "alpha".to_string(),
-                cwd: None,
-                env: BTreeMap::new(),
-                focus: false,
-            })
-        );
-        assert_eq!(
-            create_workspace_calls[1],
-            &Call::CreateWorkspace(WorkspaceOpts {
-                label: "beta".to_string(),
-                cwd: None,
-                env: BTreeMap::new(),
-                focus: false,
-            })
-        );
-
-        assert!(
-            !mock
-                .calls
-                .iter()
-                .any(|c| matches!(c, Call::FocusPane { .. }))
-        );
-    }
-
-    #[test]
-    fn should_pass_workspace_focus_and_split_focus_when_workspace_and_pane_both_have_focus() {
-        let ws1 = Workspace {
-            name: "alpha".to_string(),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![Pane {
-                    command: Some("nvim".to_string()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let ws2 = Workspace {
-            name: "beta".to_string(),
-            focus: true,
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![
-                    Pane {
-                        command: None,
-                        ..Default::default()
-                    },
-                    Pane {
-                        command: Some("cargo run".to_string()),
-                        focus: true,
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let file = SpreadFile {
-            workspaces: vec![ws1, ws2],
-        };
-        let mut mock = MockBackend::default();
-
-        engine::apply(&file, &mut mock).unwrap();
-
-        let create_workspace_calls: Vec<&Call> = mock
-            .calls
-            .iter()
-            .filter(|c| matches!(c, Call::CreateWorkspace(_)))
-            .collect();
-        assert_eq!(create_workspace_calls.len(), 2);
-        assert_eq!(
-            create_workspace_calls[0],
-            &Call::CreateWorkspace(WorkspaceOpts {
-                label: "alpha".to_string(),
-                cwd: None,
-                env: BTreeMap::new(),
-                focus: false,
-            })
-        );
-        assert_eq!(
-            create_workspace_calls[1],
-            &Call::CreateWorkspace(WorkspaceOpts {
-                label: "beta".to_string(),
-                cwd: None,
-                env: BTreeMap::new(),
-                focus: true,
-            })
-        );
-
-        let split_call = mock
-            .calls
-            .iter()
-            .find(|c| matches!(c, Call::SplitPane { .. }))
-            .expect("split_pane not called");
-        assert_eq!(
-            split_call,
-            &Call::SplitPane {
-                from: "w2:p1".to_string(),
-                opts: SplitOpts {
-                    direction: SplitDirection::Right,
-                    ratio: None,
-                    focus: true,
-                    ..Default::default()
+        #[test]
+        fn should_thread_split_pane_returned_id_into_subsequent_run() {
+            let plan = vec![
+                BackendOp::CreateWorkspace(WorkspaceOpts {
+                    label: "demo".into(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    focus: false,
+                }),
+                BackendOp::SplitPane {
+                    from: PaneHandle::TabRoot(0),
+                    into: PaneHandle::Split(1),
+                    opts: SplitOpts::default(),
                 },
-            }
-        );
-        assert!(
-            !mock
-                .calls
-                .iter()
-                .any(|c| matches!(c, Call::FocusPane { .. }))
-        );
+                BackendOp::Run {
+                    pane: PaneHandle::Split(1),
+                    command: "watch".into(),
+                },
+            ];
+            let mut rec = RecordingBackend::default();
+            engine::execute_plan(&plan, &mut rec).unwrap();
+            assert_eq!(
+                rec.log,
+                vec![
+                    "create_workspace label=demo focus=false".to_string(),
+                    "split_pane from=w1:p1 -> w1:p2 dir=Right focus=false".to_string(),
+                    "run w1:p2 watch".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn should_thread_create_tab_indexed_handle_into_run_on_tabroot_index() {
+            let plan = vec![
+                BackendOp::CreateWorkspace(WorkspaceOpts {
+                    label: "demo".into(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    focus: false,
+                }),
+                BackendOp::CreateTab {
+                    index: 1,
+                    opts: TabOpts {
+                        label: None,
+                        cwd: None,
+                        focus: false,
+                    },
+                },
+                BackendOp::Run {
+                    pane: PaneHandle::TabRoot(1),
+                    command: "cargo run".into(),
+                },
+            ];
+            let mut rec = RecordingBackend::default();
+            engine::execute_plan(&plan, &mut rec).unwrap();
+            assert_eq!(
+                rec.log,
+                vec![
+                    "create_workspace label=demo focus=false".to_string(),
+                    "create_tab ws=w1 label=None cwd=None".to_string(),
+                    "run w1:p2 cargo run".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn should_rename_first_tab_via_rename_first_tab_op_between_create_workspace_and_run() {
+            let plan = vec![
+                BackendOp::CreateWorkspace(WorkspaceOpts {
+                    label: "demo".into(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    focus: false,
+                }),
+                BackendOp::RenameFirstTab {
+                    label: "editor".into(),
+                },
+                BackendOp::Run {
+                    pane: PaneHandle::TabRoot(0),
+                    command: "nvim".into(),
+                },
+            ];
+            let mut rec = RecordingBackend::default();
+            engine::execute_plan(&plan, &mut rec).unwrap();
+            assert_eq!(
+                rec.log,
+                vec![
+                    "create_workspace label=demo focus=false".to_string(),
+                    "rename_tab w1:t1 -> editor".to_string(),
+                    "run w1:p1 nvim".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn should_emit_wait_output_op_after_run_op_in_plan_order() {
+            let plan = vec![
+                BackendOp::CreateWorkspace(WorkspaceOpts {
+                    label: "demo".into(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    focus: false,
+                }),
+                BackendOp::Run {
+                    pane: PaneHandle::TabRoot(0),
+                    command: "watch".into(),
+                },
+                BackendOp::WaitOutput {
+                    pane: PaneHandle::TabRoot(0),
+                    wait: WaitFor {
+                        pattern: "ready".into(),
+                        timeout_ms: None,
+                    },
+                },
+            ];
+            let mut rec = RecordingBackend::default();
+            engine::execute_plan(&plan, &mut rec).unwrap();
+            assert_eq!(
+                rec.log,
+                vec![
+                    "create_workspace label=demo focus=false".to_string(),
+                    "run w1:p1 watch".to_string(),
+                    "wait_output w1:p1 pattern=ready".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn should_make_no_backend_calls_given_empty_workspaces_list() {
+            let file = SpreadFile { workspaces: vec![] };
+            let plan = engine::plan_file(&file);
+            assert!(plan.is_empty());
+            let mut rec = RecordingBackend::default();
+            engine::execute_plan(&plan, &mut rec).unwrap();
+            assert!(rec.log.is_empty());
+        }
     }
 
-    #[test]
-    fn should_pass_focus_to_last_workspace_with_focus_true() {
-        let ws1 = Workspace {
-            name: "alpha".to_string(),
-            focus: true,
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![Pane {
-                    command: Some("nvim".to_string()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let ws2 = Workspace {
-            name: "beta".to_string(),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![Pane {
-                    command: Some("cargo run".to_string()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let ws3 = Workspace {
-            name: "gamma".to_string(),
-            focus: true,
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![Pane {
-                    command: Some("logs".to_string()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let file = SpreadFile {
-            workspaces: vec![ws1, ws2, ws3],
-        };
-        let mut mock = MockBackend::default();
+    mod plan_tests {
+        use super::*;
+        use crate::engine::{BackendOp, PaneHandle};
 
-        engine::apply(&file, &mut mock).unwrap();
-
-        let create_workspace_calls: Vec<&Call> = mock
-            .calls
-            .iter()
-            .filter(|c| matches!(c, Call::CreateWorkspace(_)))
-            .collect();
-        assert_eq!(create_workspace_calls.len(), 3);
-        assert_eq!(
-            create_workspace_calls[0],
-            &Call::CreateWorkspace(WorkspaceOpts {
-                label: "alpha".to_string(),
-                cwd: None,
-                env: BTreeMap::new(),
-                focus: true,
-            })
-        );
-        assert_eq!(
-            create_workspace_calls[1],
-            &Call::CreateWorkspace(WorkspaceOpts {
-                label: "beta".to_string(),
-                cwd: None,
-                env: BTreeMap::new(),
-                focus: false,
-            })
-        );
-        assert_eq!(
-            create_workspace_calls[2],
-            &Call::CreateWorkspace(WorkspaceOpts {
-                label: "gamma".to_string(),
-                cwd: None,
-                env: BTreeMap::new(),
-                focus: true,
-            })
-        );
-        assert!(
-            !mock
-                .calls
-                .iter()
-                .any(|c| matches!(c, Call::FocusPane { .. }))
-        );
-    }
-
-    #[test]
-    fn should_make_no_backend_calls_given_empty_workspaces_list() {
-        let file = SpreadFile { workspaces: vec![] };
-        let mut mock = MockBackend::default();
-
-        let result = engine::apply(&file, &mut mock);
-
-        assert!(result.is_ok());
-        assert!(mock.calls.is_empty());
-    }
-
-    #[test]
-    fn should_pass_focus_to_split_pane_when_second_pane_has_focus_true() {
-        let ws = Workspace {
-            name: "demo".to_string(),
-            tabs: vec![Tab {
-                label: Some("editor".to_string()),
-                panes: vec![
-                    Pane {
+        #[test]
+        fn should_render_minimal_single_tab_workspace_as_create_workspace_then_run() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                tabs: vec![Tab {
+                    panes: vec![Pane {
                         command: Some("nvim".to_string()),
                         ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "nvim".to_string(),
                     },
-                    Pane {
-                        command: Some("lazygit".to_string()),
-                        split: SplitDirection::Right,
-                        focus: true,
+                ]
+            );
+        }
+
+        #[test]
+        fn should_emit_rename_first_tab_op_when_workspace_first_tab_has_a_label() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                tabs: vec![Tab {
+                    label: Some("editor".to_string()),
+                    panes: vec![Pane {
+                        command: Some("nvim".to_string()),
                         ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::RenameFirstTab {
+                        label: "editor".to_string(),
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "nvim".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_emit_create_tab_op_for_second_tab_threading_tab_index_and_resolved_cwd() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                root: Some(PathBuf::from("/proj")),
+                tabs: vec![
+                    Tab {
+                        panes: vec![Pane {
+                            command: None,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    Tab {
+                        label: Some("server".to_string()),
+                        cwd: Some(PathBuf::from("./svc")),
+                        panes: vec![Pane {
+                            command: Some("cargo run".to_string()),
+                            ..Default::default()
+                        }],
                     },
                 ],
                 ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let file = SpreadFile {
-            workspaces: vec![ws],
-        };
-        let mut mock = MockBackend::default();
+            };
 
-        engine::apply(&file, &mut mock).unwrap();
+            let plan = engine::plan_workspace(&ws);
 
-        let split_call = mock
-            .calls
-            .iter()
-            .find(|c| matches!(c, Call::SplitPane { .. }))
-            .expect("split_pane not called");
-        assert_eq!(
-            split_call,
-            &Call::SplitPane {
-                from: "w1:p1".to_string(),
-                opts: SplitOpts {
-                    direction: SplitDirection::Right,
-                    ratio: None,
-                    focus: true,
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: Some(PathBuf::from("/proj")),
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::CreateTab {
+                        index: 1,
+                        opts: TabOpts {
+                            label: Some("server".to_string()),
+                            cwd: Some(PathBuf::from("/proj/svc")),
+                            focus: false,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(1),
+                        command: "cargo run".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_emit_split_pane_op_with_direction_ratio_and_handles_for_multi_pane_tab() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                tabs: vec![Tab {
+                    label: None,
+                    panes: vec![
+                        Pane {
+                            command: None,
+                            ..Default::default()
+                        },
+                        Pane {
+                            command: Some("watch".to_string()),
+                            split: SplitDirection::Down,
+                            ratio: Some(0.3),
+                            ..Default::default()
+                        },
+                        Pane {
+                            command: Some("logs".to_string()),
+                            ..Default::default()
+                        },
+                    ],
                     ..Default::default()
-                },
-            }
-        );
-        assert!(
-            !mock
-                .calls
-                .iter()
-                .any(|c| matches!(c, Call::FocusPane { .. }))
-        );
-    }
+                }],
+                ..Default::default()
+            };
 
-    #[test]
-    fn should_pass_focus_to_split_pane_when_pane_has_focus_true_without_calling_focus_pane() {
-        let ws = Workspace {
-            name: "demo".to_string(),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![
-                    Pane {
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::SplitPane {
+                        from: PaneHandle::TabRoot(0),
+                        into: PaneHandle::Split(1),
+                        opts: SplitOpts {
+                            direction: SplitDirection::Down,
+                            ratio: Some(0.3),
+                            cwd: None,
+                            env: BTreeMap::new(),
+                            focus: false,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::Split(1),
+                        command: "watch".to_string(),
+                    },
+                    BackendOp::SplitPane {
+                        from: PaneHandle::Split(1),
+                        into: PaneHandle::Split(2),
+                        opts: SplitOpts {
+                            direction: SplitDirection::Right,
+                            ratio: None,
+                            cwd: None,
+                            env: BTreeMap::new(),
+                            focus: false,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::Split(2),
+                        command: "logs".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_thread_pane_cwd_and_env_into_split_opts() {
+            let mut pane_env = BTreeMap::new();
+            pane_env.insert("FOO".to_string(), "bar".to_string());
+
+            let ws = Workspace {
+                name: "demo".to_string(),
+                root: Some(PathBuf::from("/proj")),
+                tabs: vec![Tab {
+                    label: None,
+                    panes: vec![
+                        Pane {
+                            command: None,
+                            ..Default::default()
+                        },
+                        Pane {
+                            command: Some("watch".to_string()),
+                            cwd: Some(PathBuf::from("./sub")),
+                            env: pane_env.clone(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: Some(PathBuf::from("/proj")),
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::SplitPane {
+                        from: PaneHandle::TabRoot(0),
+                        into: PaneHandle::Split(1),
+                        opts: SplitOpts {
+                            direction: SplitDirection::Right,
+                            ratio: None,
+                            cwd: Some(PathBuf::from("/proj/sub")),
+                            env: pane_env,
+                            focus: false,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::Split(1),
+                        command: "watch".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_emit_wait_output_op_after_run_op_when_pane_has_wait_for() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                tabs: vec![Tab {
+                    label: None,
+                    panes: vec![
+                        Pane {
+                            command: Some("watch".to_string()),
+                            wait_for: Some(WaitFor {
+                                pattern: "ready".to_string(),
+                                timeout_ms: None,
+                            }),
+                            ..Default::default()
+                        },
+                        Pane {
+                            command: Some("logs".to_string()),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "watch".to_string(),
+                    },
+                    BackendOp::WaitOutput {
+                        pane: PaneHandle::TabRoot(0),
+                        wait: WaitFor {
+                            pattern: "ready".to_string(),
+                            timeout_ms: None,
+                        },
+                    },
+                    BackendOp::SplitPane {
+                        from: PaneHandle::TabRoot(0),
+                        into: PaneHandle::Split(1),
+                        opts: SplitOpts {
+                            direction: SplitDirection::Right,
+                            ratio: None,
+                            cwd: None,
+                            env: BTreeMap::new(),
+                            focus: false,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::Split(1),
+                        command: "logs".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_wrap_first_pane_command_with_cd_and_env_export_given_overrides() {
+            let mut pane_env = BTreeMap::new();
+            pane_env.insert("FOO".to_string(), "bar".to_string());
+
+            let ws = Workspace {
+                name: "demo".to_string(),
+                root: Some(PathBuf::from("/proj")),
+                tabs: vec![Tab {
+                    label: None,
+                    cwd: Some(PathBuf::from("./sub")),
+                    panes: vec![Pane {
+                        command: Some("nvim".to_string()),
+                        cwd: Some(PathBuf::from("./inner")),
+                        env: pane_env,
+                        ..Default::default()
+                    }],
+                }],
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: Some(PathBuf::from("/proj")),
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "cd '/proj/sub/inner' && export FOO='bar' && nvim".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_emit_run_op_with_bare_cd_and_export_when_first_pane_has_cwd_env_but_no_command() {
+            let mut pane_env = BTreeMap::new();
+            pane_env.insert("FOO".to_string(), "bar".to_string());
+
+            let ws = Workspace {
+                name: "demo".to_string(),
+                root: Some(PathBuf::from("/proj")),
+                tabs: vec![Tab {
+                    label: None,
+                    cwd: Some(PathBuf::from("./sub")),
+                    panes: vec![Pane {
+                        command: None,
+                        env: pane_env,
+                        ..Default::default()
+                    }],
+                }],
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: Some(PathBuf::from("/proj")),
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "cd '/proj/sub' && export FOO='bar'".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_emit_no_run_op_when_first_pane_has_no_command_cwd_or_env() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                tabs: vec![Tab {
+                    label: None,
+                    panes: vec![Pane {
                         command: None,
                         ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![BackendOp::CreateWorkspace(WorkspaceOpts {
+                    label: "demo".to_string(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    focus: false,
+                })]
+            );
+        }
+
+        #[test]
+        fn should_resolve_tab_cwd_against_root_in_create_tab_opts_for_second_tab() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                root: Some(PathBuf::from("/proj")),
+                tabs: vec![
+                    Tab {
+                        panes: vec![Pane {
+                            command: None,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
                     },
-                    Pane {
-                        command: Some("watch".to_string()),
-                        focus: true,
+                    Tab {
+                        label: Some("server".to_string()),
+                        cwd: Some(PathBuf::from("./svc")),
+                        panes: vec![Pane {
+                            command: Some("cargo run".to_string()),
+                            ..Default::default()
+                        }],
+                    },
+                ],
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: Some(PathBuf::from("/proj")),
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::CreateTab {
+                        index: 1,
+                        opts: TabOpts {
+                            label: Some("server".to_string()),
+                            cwd: Some(PathBuf::from("/proj/svc")),
+                            focus: false,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(1),
+                        command: "cargo run".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_pass_focus_true_to_create_tab_opts_when_pane_in_non_first_tab_has_focus() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                tabs: vec![
+                    Tab {
+                        panes: vec![Pane {
+                            command: None,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    Tab {
+                        label: Some("server".to_string()),
+                        panes: vec![Pane {
+                            command: Some("cargo run".to_string()),
+                            focus: true,
+                            ..Default::default()
+                        }],
                         ..Default::default()
                     },
                 ],
                 ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
+            };
 
-        engine::apply_workspace(&ws, &mut mock).unwrap();
+            let plan = engine::plan_workspace(&ws);
 
-        assert_eq!(
-            mock.calls[1],
-            Call::SplitPane {
-                from: "w1:p1".to_string(),
-                opts: SplitOpts {
-                    direction: SplitDirection::Right,
-                    ratio: None,
-                    focus: true,
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::CreateTab {
+                        index: 1,
+                        opts: TabOpts {
+                            label: Some("server".to_string()),
+                            cwd: None,
+                            focus: true,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(1),
+                        command: "cargo run".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_pass_no_focus_when_neither_pane_nor_workspace_has_focus() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                tabs: vec![Tab {
+                    label: None,
+                    panes: vec![
+                        Pane {
+                            command: Some("nvim".to_string()),
+                            ..Default::default()
+                        },
+                        Pane {
+                            command: Some("watch".to_string()),
+                            ..Default::default()
+                        },
+                    ],
                     ..Default::default()
-                },
-            }
-        );
-        assert!(
-            !mock
-                .calls
-                .iter()
-                .any(|c| matches!(c, Call::FocusPane { .. }))
-        );
+                }],
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "nvim".to_string(),
+                    },
+                    BackendOp::SplitPane {
+                        from: PaneHandle::TabRoot(0),
+                        into: PaneHandle::Split(1),
+                        opts: SplitOpts {
+                            direction: SplitDirection::Right,
+                            ratio: None,
+                            cwd: None,
+                            env: BTreeMap::new(),
+                            focus: false,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::Split(1),
+                        command: "watch".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_emit_one_create_workspace_per_workspace_with_no_focus_for_unfocused_workspaces() {
+            let ws1 = Workspace {
+                name: "alpha".to_string(),
+                tabs: vec![Tab {
+                    panes: vec![Pane {
+                        command: Some("nvim".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let ws2 = Workspace {
+                name: "beta".to_string(),
+                tabs: vec![Tab {
+                    panes: vec![Pane {
+                        command: Some("cargo run".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let file = SpreadFile {
+                workspaces: vec![ws1, ws2],
+            };
+
+            let plan = engine::plan_file(&file);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "alpha".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "nvim".to_string(),
+                    },
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "beta".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "cargo run".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_or_workspace_focus_and_first_pane_focus_into_create_workspace_focus() {
+            let ws1 = Workspace {
+                name: "alpha".to_string(),
+                tabs: vec![Tab {
+                    panes: vec![Pane {
+                        command: Some("nvim".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let ws2 = Workspace {
+                name: "beta".to_string(),
+                focus: true,
+                tabs: vec![Tab {
+                    panes: vec![
+                        Pane {
+                            command: None,
+                            ..Default::default()
+                        },
+                        Pane {
+                            command: Some("cargo run".to_string()),
+                            focus: true,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let file = SpreadFile {
+                workspaces: vec![ws1, ws2],
+            };
+
+            let plan = engine::plan_file(&file);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "alpha".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "nvim".to_string(),
+                    },
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "beta".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: true,
+                    }),
+                    BackendOp::SplitPane {
+                        from: PaneHandle::TabRoot(0),
+                        into: PaneHandle::Split(1),
+                        opts: SplitOpts {
+                            direction: SplitDirection::Right,
+                            ratio: None,
+                            cwd: None,
+                            env: BTreeMap::new(),
+                            focus: true,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::Split(1),
+                        command: "cargo run".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_emit_focus_true_on_create_workspace_for_every_workspace_with_focus_true() {
+            let ws1 = Workspace {
+                name: "alpha".to_string(),
+                focus: true,
+                tabs: vec![Tab {
+                    panes: vec![Pane {
+                        command: Some("nvim".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let ws2 = Workspace {
+                name: "beta".to_string(),
+                tabs: vec![Tab {
+                    panes: vec![Pane {
+                        command: Some("cargo run".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let ws3 = Workspace {
+                name: "gamma".to_string(),
+                focus: true,
+                tabs: vec![Tab {
+                    panes: vec![Pane {
+                        command: Some("logs".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let file = SpreadFile {
+                workspaces: vec![ws1, ws2, ws3],
+            };
+
+            let plan = engine::plan_file(&file);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "alpha".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: true,
+                    }),
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "nvim".to_string(),
+                    },
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "beta".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "cargo run".to_string(),
+                    },
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "gamma".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: true,
+                    }),
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "logs".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_pass_focus_true_to_split_pane_opts_when_split_pane_has_focus() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                tabs: vec![Tab {
+                    label: Some("editor".to_string()),
+                    panes: vec![
+                        Pane {
+                            command: Some("nvim".to_string()),
+                            ..Default::default()
+                        },
+                        Pane {
+                            command: Some("lazygit".to_string()),
+                            split: SplitDirection::Right,
+                            focus: true,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::RenameFirstTab {
+                        label: "editor".to_string(),
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::TabRoot(0),
+                        command: "nvim".to_string(),
+                    },
+                    BackendOp::SplitPane {
+                        from: PaneHandle::TabRoot(0),
+                        into: PaneHandle::Split(1),
+                        opts: SplitOpts {
+                            direction: SplitDirection::Right,
+                            ratio: None,
+                            cwd: None,
+                            env: BTreeMap::new(),
+                            focus: true,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::Split(1),
+                        command: "lazygit".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[allow(clippy::too_many_lines)]
+        #[test]
+        fn should_assign_distinct_split_handles_to_each_split_within_a_workspace() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                tabs: vec![
+                    Tab {
+                        panes: vec![
+                            Pane {
+                                command: None,
+                                ..Default::default()
+                            },
+                            Pane {
+                                command: Some("top".to_string()),
+                                ..Default::default()
+                            },
+                            Pane {
+                                command: Some("bottom".to_string()),
+                                split: SplitDirection::Down,
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    Tab {
+                        panes: vec![
+                            Pane {
+                                command: None,
+                                ..Default::default()
+                            },
+                            Pane {
+                                command: Some("side".to_string()),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![
+                    BackendOp::CreateWorkspace(WorkspaceOpts {
+                        label: "demo".to_string(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        focus: false,
+                    }),
+                    BackendOp::SplitPane {
+                        from: PaneHandle::TabRoot(0),
+                        into: PaneHandle::Split(1),
+                        opts: SplitOpts {
+                            direction: SplitDirection::Right,
+                            ratio: None,
+                            cwd: None,
+                            env: BTreeMap::new(),
+                            focus: false,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::Split(1),
+                        command: "top".to_string(),
+                    },
+                    BackendOp::SplitPane {
+                        from: PaneHandle::Split(1),
+                        into: PaneHandle::Split(2),
+                        opts: SplitOpts {
+                            direction: SplitDirection::Down,
+                            ratio: None,
+                            cwd: None,
+                            env: BTreeMap::new(),
+                            focus: false,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::Split(2),
+                        command: "bottom".to_string(),
+                    },
+                    BackendOp::CreateTab {
+                        index: 1,
+                        opts: TabOpts {
+                            label: None,
+                            cwd: None,
+                            focus: false,
+                        },
+                    },
+                    BackendOp::SplitPane {
+                        from: PaneHandle::TabRoot(1),
+                        into: PaneHandle::Split(3),
+                        opts: SplitOpts {
+                            direction: SplitDirection::Right,
+                            ratio: None,
+                            cwd: None,
+                            env: BTreeMap::new(),
+                            focus: false,
+                        },
+                    },
+                    BackendOp::Run {
+                        pane: PaneHandle::Split(3),
+                        command: "side".to_string(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn should_emit_only_create_workspace_when_workspace_has_no_tabs() {
+            let ws = Workspace {
+                name: "demo".to_string(),
+                ..Default::default()
+            };
+
+            let plan = engine::plan_workspace(&ws);
+
+            assert_eq!(
+                plan,
+                vec![BackendOp::CreateWorkspace(WorkspaceOpts {
+                    label: "demo".to_string(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    focus: false,
+                })]
+            );
+        }
+    }
+
+    mod render_tests {
+        use super::*;
+        use crate::engine::{BackendOp, PaneHandle, render_op};
+
+        #[test]
+        fn should_render_create_workspace_as_human_readable_line() {
+            assert_eq!(
+                render_op(&BackendOp::CreateWorkspace(WorkspaceOpts {
+                    label: "demo".into(),
+                    cwd: Some(PathBuf::from("/proj")),
+                    env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
+                    focus: true,
+                })),
+                "workspace create --label 'demo' --cwd /proj --env FOO='bar' --focus"
+            );
+        }
+
+        #[test]
+        fn should_render_create_workspace_without_optional_fields() {
+            assert_eq!(
+                render_op(&BackendOp::CreateWorkspace(WorkspaceOpts {
+                    label: "minimal".into(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    focus: false,
+                })),
+                "workspace create --label 'minimal' --no-focus"
+            );
+        }
+
+        #[test]
+        fn should_render_rename_first_tab_as_human_readable_line() {
+            assert_eq!(
+                render_op(&BackendOp::RenameFirstTab {
+                    label: "editor".into(),
+                }),
+                "tab rename --label 'editor'"
+            );
+        }
+
+        #[test]
+        fn should_render_create_tab_as_human_readable_line() {
+            assert_eq!(
+                render_op(&BackendOp::CreateTab {
+                    index: 2,
+                    opts: TabOpts {
+                        label: Some("server".into()),
+                        cwd: Some(PathBuf::from("/proj/svc")),
+                        focus: true,
+                    },
+                }),
+                "tab create --index 2 --label 'server' --cwd /proj/svc --focus"
+            );
+        }
+
+        #[test]
+        fn should_render_create_tab_without_optional_fields() {
+            assert_eq!(
+                render_op(&BackendOp::CreateTab {
+                    index: 1,
+                    opts: TabOpts {
+                        label: None,
+                        cwd: None,
+                        focus: false,
+                    },
+                }),
+                "tab create --index 1 --no-focus"
+            );
+        }
+
+        #[test]
+        fn should_render_split_pane_as_human_readable_line() {
+            let mut env = BTreeMap::new();
+            env.insert("KEY".to_string(), "value".to_string());
+            assert_eq!(
+                render_op(&BackendOp::SplitPane {
+                    from: PaneHandle::TabRoot(0),
+                    into: PaneHandle::Split(1),
+                    opts: SplitOpts {
+                        direction: SplitDirection::Down,
+                        ratio: Some(0.3),
+                        cwd: Some(PathBuf::from("/proj/sub")),
+                        env,
+                        focus: true,
+                    },
+                }),
+                "pane split TabRoot(0) -> Split(1) --direction down --ratio 0.3 --cwd /proj/sub --env KEY='value' --focus"
+            );
+        }
+
+        #[test]
+        fn should_render_split_pane_without_optional_fields() {
+            assert_eq!(
+                render_op(&BackendOp::SplitPane {
+                    from: PaneHandle::TabRoot(0),
+                    into: PaneHandle::Split(1),
+                    opts: SplitOpts::default(),
+                }),
+                "pane split TabRoot(0) -> Split(1) --direction right --no-focus"
+            );
+        }
+
+        #[test]
+        fn should_render_run_as_human_readable_line() {
+            assert_eq!(
+                render_op(&BackendOp::Run {
+                    pane: PaneHandle::Split(1),
+                    command: "cargo run".into(),
+                }),
+                "pane run Split(1) cargo run"
+            );
+        }
+
+        #[test]
+        fn should_render_wait_output_as_human_readable_line() {
+            assert_eq!(
+                render_op(&BackendOp::WaitOutput {
+                    pane: PaneHandle::TabRoot(0),
+                    wait: WaitFor {
+                        pattern: "ready".into(),
+                        timeout_ms: Some(5000),
+                    },
+                }),
+                "wait output TabRoot(0) --match 'ready' --timeout 5000"
+            );
+        }
+
+        #[test]
+        fn should_render_wait_output_without_timeout() {
+            assert_eq!(
+                render_op(&BackendOp::WaitOutput {
+                    pane: PaneHandle::TabRoot(0),
+                    wait: WaitFor {
+                        pattern: "done".into(),
+                        timeout_ms: None,
+                    },
+                }),
+                "wait output TabRoot(0) --match 'done'"
+            );
+        }
+
+        #[test]
+        fn should_quote_shell_special_characters_in_rendered_strings() {
+            assert_eq!(
+                render_op(&BackendOp::RenameFirstTab {
+                    label: "it's ok".into(),
+                }),
+                "tab rename --label 'it'\\''s ok'"
+            );
+        }
     }
 }
