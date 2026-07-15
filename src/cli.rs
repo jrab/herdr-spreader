@@ -17,6 +17,8 @@ pub enum Command {
     Apply {
         #[arg(long, short)]
         file: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -32,17 +34,54 @@ mod tests {
             cli.command,
             Command::Apply {
                 file: Some(PathBuf::from("./spread.yml")),
+                dry_run: false,
             }
         );
 
         let cli = Cli::try_parse_from(["herdr-spreader", "apply"]).unwrap();
-        assert_eq!(cli.command, Command::Apply { file: None });
+        assert_eq!(
+            cli.command,
+            Command::Apply {
+                file: None,
+                dry_run: false
+            }
+        );
 
         let cli = Cli::try_parse_from(["herdr-spreader", "apply", "-f", "./spread.yml"]).unwrap();
         assert_eq!(
             cli.command,
             Command::Apply {
                 file: Some(PathBuf::from("./spread.yml")),
+                dry_run: false,
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_apply_subcommand_with_dry_run_flag() {
+        let cli = Cli::try_parse_from(["herdr-spreader", "apply", "--dry-run"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Apply {
+                file: None,
+                dry_run: true
+            }
+        );
+        let cli =
+            Cli::try_parse_from(["herdr-spreader", "apply", "--file", "x", "--dry-run"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Apply {
+                file: Some(PathBuf::from("x")),
+                dry_run: true
+            }
+        );
+        let cli = Cli::try_parse_from(["herdr-spreader", "apply"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Apply {
+                file: None,
+                dry_run: false
             }
         );
     }
