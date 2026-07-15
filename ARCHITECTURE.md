@@ -9,7 +9,7 @@ src/
 ├── main.rs        thin CLI entry point: wires config → engine → backend together
 ├── cli.rs         clap argument parsing (`apply --file <path>`)
 ├── config.rs       YAML → SpreadFile (a list of Workspaces), plus all path resolution (root/cwd/tilde)
-├── engine.rs       pure expansion logic: SpreadFile → sequence of HerdrBackend calls
+├── engine.rs       pure plan logic (`plan_workspace`, `plan_file` — Calculations) + `execute_plan` Action + `BackendOp`/`PaneHandle` Data types
 ├── backend/
 │   ├── mod.rs      the HerdrBackend trait and its Opts/Created/Error types
 │   └── cli.rs      CliBackend: HerdrBackend implemented by spawning the herdr binary
@@ -25,7 +25,7 @@ main.rs ──▶ engine.rs ──▶ backend/mod.rs (trait only)
 main.rs ──▶ backend/cli.rs ──implements──▶ backend/mod.rs
 ```
 
-`engine.rs` depends only on the `HerdrBackend` **trait**, never on `CliBackend` directly. That's what makes the engine's expansion logic testable without spawning real processes (see [Testing strategy](#testing-strategy)).
+`engine.rs` depends only on the `HerdrBackend` **trait**, never on `CliBackend` directly. That's what makes the engine's expansion logic testable by asserting the `Vec<BackendOp>` plan directly, with no mock of the backend (see [Testing strategy](#testing-strategy)).
 
 ## Data flow
 
@@ -46,19 +46,16 @@ SpreadFile { workspaces: Vec<Workspace> }  (raw, as written by the user)
     │    config would be
     ▼
 SpreadFile (every workspace's root defaulted + absolute, ~ expanded everywhere)
-    │  engine::apply(&file, &mut backend)
+    │  engine::plan_file(&file)
     ▼
-for each workspace, in order:
-    │  apply_workspace(workspace, &mut backend) → a focus-pane-id candidate
-    │  — apply_workspace never calls focus_pane itself; it only returns which
-    │    pane *would* be focused if this workspace turns out to be the winner
+Vec<BackendOp> — one flat plan for the whole file
+    │  engine::execute_plan(plan, &mut backend)
     ▼
-apply keeps a running "chosen" candidate as it goes — a workspace's own
-`focus: true` overrides the running choice (last workspace to set it wins),
-and the first workspace's candidate is the choice if none does — then, once
-every workspace has been built, calls backend.focus_pane(chosen) exactly once
+walk the plan in order; each `create_*` / `split_pane` returns an id that is
+threaded into a `HashMap<PaneHandle, String>` registry, so later ops can refer
+to earlier-created workspaces, tabs, and panes by their stable handles
     ▼
-an actual set of herdr workspaces, with tabs, panes, commands, and one focused pane
+an actual set of herdr workspaces, with tabs, panes, commands, and focused panes
 ```
 
 Each stage is a separate module and is unit-tested independently; only the final wiring in `main.rs` is untested by design (see [Testing strategy](#testing-strategy)).
@@ -71,7 +68,7 @@ The one wrinkle: `herdr workspace create` and `herdr tab create` don't just crea
 
 ## `engine.rs`: why "first panes" are special-cased
 
-`engine::apply(&file, backend)` itself only does one thing: it loops over `file.workspaces` in order, calling `apply_workspace(workspace, backend)` for each one, and folds the focus-pane-id candidate each call returns into a single running "chosen" id (see [Focus, deferred across two levels](#focus-deferred-across-two-levels) below). All of the interesting per-layout logic lives in `apply_workspace`, which walks `workspace.tabs[*].panes[*]` and, for each pane, decides which `HerdrBackend` call creates it:
+`engine::plan_file(&file)` is a pure Calculation: it loops over `file.workspaces` in order, calling `plan_workspace(workspace)` for each one, and concatenates the resulting `Vec<BackendOp>` into a single flat plan for the whole file. All of the interesting per-layout logic lives in `plan_workspace`, which walks `workspace.tabs[*].panes[*]` and, for each pane, decides which `BackendOp` creates it:
 
 - **A tab's first pane** (`pane_index == 0`) is never created directly — it's the root pane that came back from `create_workspace` (for the first tab) or `create_tab` (for every other tab). There is no `HerdrBackend::create_first_pane` call; it already exists.
 - **Every other pane** is created by `split_pane`, splitting off the previous pane in the tab.
@@ -82,24 +79,23 @@ This asymmetry matters because `create_workspace`, `create_tab`, and `split_pane
 cd '<resolved dir>' && export KEY='value' && <the user's command>
 ```
 
-built by `cwd_env_prefix` / `wrap_command_with_cwd_and_env`, with `shell_quote` doing POSIX single-quote escaping so paths and values with spaces or special characters survive intact. If the first pane has *no* command but does need a `cwd`/`env`, the bare `cd && export` line is still run — otherwise a `cwd:`-only entry in the YAML would be silently ignored. If the first pane needs neither, no `run` call happens at all, avoiding a pointless extra `cd .` (`needs_cwd_override` in `engine.rs` decides this).
+built by `cwd_env_prefix` / `wrap_command_with_cwd_and_env`, with `shell_quote` doing POSIX single-quote escaping so paths and values with spaces or special characters survive intact. If the first pane has *no* command but does need a `cwd`/`env`, the bare `cd && export` line is still run — otherwise a `cwd:`-only entry in the YAML would be silently ignored. If the first pane needs neither, no `run` call happens at all, avoiding a pointless extra `cd .` (`needs_cwd_override`, called inside `plan_workspace`, decides this).
 
 Everything else follows directly from that split:
 
 - **Path composition** (`resolve_cwd` / `combine_cwd`) layers `root → tab.cwd → pane.cwd` top-down: each level is joined onto the previous one unless it's already absolute, in which case it replaces everything above it. `..` is deliberately left alone (the shell resolves it at `cd` time); only literal `.` components are stripped (`normalize_path`).
-- **`wait_for` on a pane with no `command`** is rejected as `EngineError::WaitForWithoutCommand` — there's no command whose output to wait for.
+- **`wait_for` on a pane with no `command`** is silently ignored: `plan_workspace` only emits a `Run` (and its companion `WaitOutput`) when the pane has a `command`. A `wait_for`-only pane produces no ops of its own — there's nothing to wait for. `EngineError` has no variant for this case (it only wraps `BackendError`); the silent-drop is intentional.
 - **IDs are never invented.** Every `workspace_id`/`tab_id`/`pane_id` used by a later call is one that came back from an earlier `HerdrBackend` response. herdr's own ids get compacted as things are created/closed, so the engine only ever trusts what the backend just told it.
 
-### Focus, deferred across two levels
+### Focus
 
-Focus follows the same design principle it always has — *"focus happens globally exactly once at the very end"* — but a second workspace-per-file level was layered on top of it:
+Focus is applied per-call via the `--focus`/`--no-focus` flags herdr accepts on creation operations:
 
-- Every create/split call passes `--no-focus`, so nothing is focused as a side effect of building the layout.
-- Within a single workspace, `apply_workspace` tracks whichever pane last had `focus: true` in that workspace's YAML (defaulting to the workspace's very first pane) and *returns* that pane id as its focus candidate. **`apply_workspace` never calls `focus_pane` itself** — it has no way to know yet whether its workspace will be the one that ends up focused.
-- Back in `engine::apply`, the outer loop tracks which *workspace* should win, using the exact same "last one wins, default to the first" rule but applied to `workspace.focus` instead of `pane.focus`: the first workspace's candidate is the initial choice, and any later workspace with `focus: true` overwrites it.
-- Only after every workspace has been built does `apply` call `backend.focus_pane` — exactly once, for the whole file — with the candidate id belonging to whichever workspace won.
+- `CreateWorkspace` passes `--focus` when `workspace.focus || first_pane.focus` is true; otherwise `--no-focus`.
+- `CreateTab` (for every tab after the first) passes `--focus` when that tab's first pane has `focus: true`; otherwise `--no-focus`.
+- `SplitPane` passes `--focus` when the pane being split off has `focus: true`; otherwise `--no-focus`.
 
-This avoids focus visibly jumping around pane-by-pane (or workspace-by-workspace) while the layout is still being built, and keeps `apply_workspace` fully decoupled from any notion of "am I the focused workspace" — it just answers "if you picked me, focus this pane."
+**No `focus_pane` call is ever made by the engine.** The `HerdrBackend::focus_pane` trait method, the `choose_focus_strategy` helper, and the socket path plumbing still exist on `CliBackend`, but they are there for other consumers — `execute_plan` never emits a `BackendOp::FocusPane`.
 
 ## `config.rs`: path resolution
 
@@ -109,7 +105,7 @@ This is the part of the codebase that took the most iteration to get right, so i
 
 1. **`root` is defaulted** to `invocation_cwd` if a workspace's YAML doesn't set one, so every workspace has an absolute anchor to resolve relative paths against — a workspace with no `root` and a tab with `cwd: ./logs` still means something well-defined.
 2. **`root` is tilde-expanded and forced absolute** (`expand_root_path`): `~` and `~/...` expand against `$HOME`; anything still relative after that is joined onto `invocation_cwd`.
-3. **`tab.cwd` and `pane.cwd` are tilde-expanded but *not* forced absolute** (`expand_tilde` only): they're meant to stay relative to their workspace's `root` (that's the whole point of a tab/pane-level override), so only a literal `~` gets special treatment. The actual `root + tab.cwd + pane.cwd` composition happens later, per-pane, inside `apply_workspace`.
+3. **`tab.cwd` and `pane.cwd` are tilde-expanded but *not* forced absolute** (`expand_tilde` only): they're meant to stay relative to their workspace's `root` (that's the whole point of a tab/pane-level override), so only a literal `~` gets special treatment. The actual `root + tab.cwd + pane.cwd` composition happens later, per-pane, inside `plan_workspace`.
 
 ### What "invocation cwd" means, and why it isn't `std::env::current_dir()`
 
@@ -151,7 +147,7 @@ If you're touching path resolution, add a test for the *specific* combination yo
 
 `backend/cli.rs` implements that trait by shelling out to the `herdr` binary and parsing its JSON stdout. Internally it's split into two halves on purpose:
 
-- **Pure functions** (`workspace_create_args`, `tab_create_args`, `pane_split_args`, `pane_run_args`, `wait_output_args`, `focus_args`, `rename_tab_args`, `pane_get_args`, and the matching `parse_*` functions) — no I/O, just `Opts → Vec<String>` and `&str (JSON) → Result<T, BackendError>`. These are unit-tested directly, without spawning anything.
+- **Pure functions** (`workspace_create_args`, `tab_create_args`, `pane_split_args`, `pane_run_args`, `wait_output_args`, `focus_args`, `rename_tab_args`, `pane_get_args`, `choose_focus_strategy`, and the matching `parse_*` functions) — no I/O, just `Opts → Vec<String>`, `Option<&str> → FocusStrategy`, and `&str (JSON) → Result<T, BackendError>`. These are unit-tested directly, without spawning anything.
 - **`CliBackend`** itself — the thin `impl HerdrBackend` that calls those pure functions and then actually runs `std::process::Command`. It's spawned via an argv array (`Command::args`, never a shell string), so there's no shell-injection surface at the herdr-invocation boundary — the only place shell syntax appears is inside the *pane's own command string*, which is sent to that pane's interactive shell via `herdr pane run`, exactly as if the user had typed it themselves.
 
 `CliBackend::resolve_bin` picks the `herdr` binary to spawn: `$HERDR_BIN_PATH` if set (mainly for tests), otherwise `herdr` on `$PATH`.
@@ -161,7 +157,7 @@ If you're touching path resolution, add a test for the *specific* combination yo
 Three layers, each targeting a different seam:
 
 1. **`config.rs` unit tests** — YAML parsing and path resolution, as plain data-in/data-out assertions. No filesystem or process access beyond `read_config`'s own file read.
-2. **`engine.rs` unit tests** — drive `apply_workspace` (and `apply`'s cross-workspace focus-selection folding on top of it) against a hand-written `MockBackend` that just records every call it receives (`Vec<Call>`). This is what makes it possible to assert "for this YAML, exactly these `HerdrBackend` calls happen, in this order, with these ids" without needing herdr installed at all.
-3. **`tests/cli_backend_integration.rs`** — the one test that exercises the full `engine::apply` → `CliBackend` → subprocess path, against `tests/fixtures/fake-herdr.sh`, a script that logs the argv it's called with and echoes back canned JSON shaped like real herdr responses. This is what catches integration bugs the mock backend can't see (e.g. an argv-building bug in `backend/cli.rs` that both the mock and the real herdr would parse differently).
+2. **`engine.rs` unit tests** — split into two seams. First, pure `plan_workspace` / `plan_file` tests assert the produced `Vec<BackendOp>` directly: "for this YAML, exactly these backend operations happen, in this order, with these handles." Second, a tiny `RecordingBackend` (a hand-written `HerdrBackend` that records every call and returns canned ids) covers `execute_plan`'s id threading: it verifies that ids returned from earlier `create_*` / `split_pane` calls are fed back into later ops via the `HashMap<PaneHandle, String>` registry.
+3. **`tests/cli_backend_integration.rs`** — exercises the full `plan_file` → `execute_plan` → `CliBackend` → subprocess path, against `tests/fixtures/fake-herdr.sh`, a script that logs the argv it's called with and echoes back canned JSON shaped like real herdr responses. This catches integration bugs the plan-level tests can't see (e.g. an argv-building bug in `backend/cli.rs`). It also includes a plan-pinning test that records the exact `Vec<BackendOp>` produced for a sample file and fails if the plan ever changes unexpectedly.
 
-Layer 3 intentionally does *not* go through `config::resolve_paths` — it builds a `SpreadFile` directly and calls `engine::apply` on it. `main.rs`'s wiring (config-path resolution, the `pane.get` cwd query, `resolve_paths`) is therefore covered only at the unit level, not end-to-end; keep that in mind if a bug ever turns up specifically in how `main.rs` composes those pieces rather than in any one of them.
+Layer 3 intentionally does *not* go through `config::resolve_paths` — it builds a `SpreadFile` directly and calls `engine::plan_file` + `engine::execute_plan` on it. `main.rs`'s wiring (config-path resolution, the `pane.get` cwd query, `resolve_paths`) is therefore covered only at the unit level, not end-to-end; keep that in mind if a bug ever turns up specifically in how `main.rs` composes those pieces rather than in any one of them.
