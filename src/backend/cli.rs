@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -228,14 +228,37 @@ pub(crate) fn parse_pane_cwd(json: &str) -> Result<Option<PathBuf>, BackendError
 
 const DEFAULT_HERDR_BIN: &str = "herdr";
 
+/// Strategy used to focus a pane.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FocusStrategy {
+    /// Focus via the herdr JSON-RPC Unix socket at the given path.
+    Socket(PathBuf),
+    /// Focus via the `herdr pane focus` CLI command.
+    Cli,
+}
+
+/// Choose the focus strategy from an optional socket path.
+///
+/// A `None` or empty string selects the CLI fallback.
+pub(crate) fn choose_focus_strategy(socket_path: Option<&str>) -> FocusStrategy {
+    match socket_path
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        Some(p) => FocusStrategy::Socket(p),
+        None => FocusStrategy::Cli,
+    }
+}
+
 pub struct CliBackend {
     bin: PathBuf,
+    socket_path: Option<PathBuf>,
 }
 
 impl CliBackend {
     #[must_use]
-    pub fn new(bin: PathBuf) -> Self {
-        Self { bin }
+    pub fn new(bin: PathBuf, socket_path: Option<PathBuf>) -> Self {
+        Self { bin, socket_path }
     }
 
     pub fn resolve_bin(env: &BTreeMap<String, String>) -> PathBuf {
@@ -288,15 +311,14 @@ impl CliBackend {
 /// Returns [`BackendError::Herdr`] if the socket is unavailable, the
 /// connection fails, or the response indicates an error.
 #[cfg(unix)]
-fn focus_pane_via_socket(pane_id: &str) -> Result<(), BackendError> {
+fn focus_pane_via_socket(pane_id: &str, socket_path: &Path) -> Result<(), BackendError> {
     use std::os::unix::net::UnixStream;
 
-    let socket_path = std::env::var("HERDR_SOCKET_PATH").map_err(|_| BackendError::Herdr {
-        message: "HERDR_SOCKET_PATH not set, cannot use socket API".to_string(),
-    })?;
-
-    let mut stream = UnixStream::connect(&socket_path).map_err(|e| BackendError::Herdr {
-        message: format!("failed to connect to herdr socket at {socket_path}: {e}"),
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| BackendError::Herdr {
+        message: format!(
+            "failed to connect to herdr socket at {}: {e}",
+            socket_path.display()
+        ),
     })?;
 
     let request = serde_json::json!({
@@ -347,7 +369,7 @@ fn focus_pane_via_socket(pane_id: &str) -> Result<(), BackendError> {
 
 /// Fallback for non-Unix platforms — always delegates to the CLI.
 #[cfg(not(unix))]
-fn focus_pane_via_socket(_pane_id: &str) -> Result<(), BackendError> {
+fn focus_pane_via_socket(_pane_id: &str, _socket_path: &Path) -> Result<(), BackendError> {
     Err(BackendError::Herdr {
         message: "socket focus not supported on this platform".to_string(),
     })
@@ -392,11 +414,11 @@ impl HerdrBackend for CliBackend {
         // Prefer the socket API — it can focus a pane directly by ID without
         // needing a direction, and the socket is always available when running
         // as a herdr plugin.  Fall back to the CLI for standalone usage.
-        if focus_pane_via_socket(pane_id).is_ok() {
-            return Ok(());
+        match choose_focus_strategy(self.socket_path.as_deref().and_then(|p| p.to_str())) {
+            FocusStrategy::Socket(p) => focus_pane_via_socket(pane_id, &p)
+                .or_else(|e| self.exec(&focus_args(pane_id)).map(|_| ()).map_err(|_| e)),
+            FocusStrategy::Cli => self.exec(&focus_args(pane_id)).map(|_| ()),
         }
-        self.exec(&focus_args(pane_id))?;
-        Ok(())
     }
 }
 
@@ -601,7 +623,7 @@ mod tests {
 
     #[test]
     fn should_return_none_when_querying_pane_cwd_against_a_binary_that_cannot_be_spawned() {
-        let backend = CliBackend::new(PathBuf::from("/no/such/herdr-binary-xyz"));
+        let backend = CliBackend::new(PathBuf::from("/no/such/herdr-binary-xyz"), None);
 
         let cwd = backend.query_pane_cwd("wA:p1");
 
@@ -627,7 +649,7 @@ mod tests {
 
     #[test]
     fn should_return_command_failed_error_with_stderr_when_process_exits_non_zero() {
-        let backend = CliBackend::new(PathBuf::from("/bin/sh"));
+        let backend = CliBackend::new(PathBuf::from("/bin/sh"), None);
 
         let result = backend.exec(&["-c".to_string(), "echo boom >&2; exit 7".to_string()]);
 
@@ -645,7 +667,7 @@ mod tests {
 
     #[test]
     fn should_return_herdr_error_when_binary_cannot_be_spawned() {
-        let backend = CliBackend::new(PathBuf::from("/no/such/herdr-binary-xyz"));
+        let backend = CliBackend::new(PathBuf::from("/no/such/herdr-binary-xyz"), None);
 
         let result = backend.exec(&["workspace".to_string(), "create".to_string()]);
 
@@ -670,5 +692,39 @@ mod tests {
         let env_without_bin = BTreeMap::new();
         let fallback = CliBackend::resolve_bin(&env_without_bin);
         assert_eq!(fallback, PathBuf::from("herdr"));
+    }
+
+    #[test]
+    fn should_choose_socket_strategy_when_socket_path_is_provided() {
+        assert_eq!(
+            choose_focus_strategy(Some("/tmp/sock")),
+            FocusStrategy::Socket(PathBuf::from("/tmp/sock"))
+        );
+    }
+
+    #[test]
+    fn should_choose_cli_strategy_when_socket_path_is_absent() {
+        assert_eq!(choose_focus_strategy(None), FocusStrategy::Cli);
+    }
+
+    #[test]
+    fn should_choose_cli_strategy_when_socket_path_is_empty_string() {
+        assert_eq!(choose_focus_strategy(Some("")), FocusStrategy::Cli);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_not_read_std_env_when_focusing_via_socket_passes_socket_path_explicitly() {
+        unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+        let mut backend = CliBackend::new(
+            PathBuf::from("/no/such/bin"),
+            Some(PathBuf::from("/tmp/nonexistent-socket-xyz")),
+        );
+        let err = backend.focus_pane("wA:p1").unwrap_err();
+        let BackendError::Herdr { message } = &err else {
+            panic!("expected Herdr error, got {err:?}")
+        };
+        assert!(message.contains("/tmp/nonexistent-socket-xyz"));
+        assert!(!message.contains("HERDR_SOCKET_PATH not set"));
     }
 }
