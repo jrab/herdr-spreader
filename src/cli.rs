@@ -46,4 +46,13 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn should_reject_validate_subcommand() {
+        let result = Cli::try_parse_from(["herdr-spreader", "validate"]);
+        assert!(
+            result.is_err(),
+            "validate subcommand should no longer be parsed"
+        );
+    }
 }
