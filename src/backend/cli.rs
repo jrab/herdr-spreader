@@ -619,7 +619,9 @@ mod tests {
             BackendError::Herdr { message } => {
                 assert!(message.contains("unknown variant"));
             }
-            other => panic!("expected BackendError::Herdr, got {other:?}"),
+            other @ BackendError::CommandFailed { .. } => {
+                panic!("expected BackendError::Herdr, got {other:?}")
+            }
         }
     }
 
@@ -635,7 +637,9 @@ mod tests {
                 assert_eq!(code, Some(7));
                 assert!(stderr.contains("boom"));
             }
-            other => panic!("expected BackendError::CommandFailed, got {other:?}"),
+            other @ BackendError::Herdr { .. } => {
+                panic!("expected BackendError::CommandFailed, got {other:?}")
+            }
         }
     }
 

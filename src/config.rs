@@ -90,12 +90,6 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to parse config file {path}: {source}")]
-    Parse {
-        path: PathBuf,
-        #[source]
-        source: serde_yaml_ng::Error,
-    },
 }
 
 const CONFIG_FILE_NAMES: &[&str] = &["config.yaml", "config.yml"];
@@ -155,18 +149,13 @@ fn config_candidate_paths(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
     paths
 }
 
-/// Load a [`SpreadFile`] from a YAML file on disk.
+/// Read a config file from disk into a `String`.
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::Io`] if the file cannot be read, or
-/// [`ConfigError::Parse`] if its contents are not valid YAML.
-pub fn load_config(path: &Path) -> Result<SpreadFile, ConfigError> {
-    let contents = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    SpreadFile::from_str(&contents).map_err(|source| ConfigError::Parse {
+/// Returns [`ConfigError::Io`] if the file cannot be read.
+pub fn read_config(path: &Path) -> Result<String, ConfigError> {
+    fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
         source,
     })
@@ -243,11 +232,11 @@ mod tests {
 
     #[test]
     fn should_parse_two_workspaces_given_multi_workspace_yaml() {
-        let yaml = r#"
+        let yaml = r"
 workspaces:
   - name: frontend
   - name: backend
-"#;
+";
 
         let file = SpreadFile::from_str(yaml).unwrap();
 
@@ -270,12 +259,12 @@ workspaces:
 
     #[test]
     fn should_parse_workspace_level_focus_flag_and_default_it_to_false() {
-        let yaml = r#"
+        let yaml = r"
 workspaces:
   - name: frontend
   - name: backend
     focus: true
-"#;
+";
 
         let file = SpreadFile::from_str(yaml).unwrap();
 
@@ -285,10 +274,10 @@ workspaces:
 
     #[test]
     fn should_parse_workspace_name_given_minimal_yaml_with_only_name() {
-        let yaml = r#"
+        let yaml = r"
 workspaces:
   - name: demo
-"#;
+";
 
         let file = SpreadFile::from_str(yaml).unwrap();
 
@@ -299,7 +288,7 @@ workspaces:
 
     #[test]
     fn should_parse_tabs_and_panes_given_tmuxinator_style_yaml() {
-        let yaml = r#"
+        let yaml = r"
 workspaces:
   - name: demo
     tabs:
@@ -309,7 +298,7 @@ workspaces:
       - label: server
         panes:
           - command: cargo run
-"#;
+";
 
         let file = SpreadFile::from_str(yaml).unwrap();
 
@@ -323,13 +312,13 @@ workspaces:
 
     #[test]
     fn should_default_split_to_right_and_ratio_to_none_when_omitted() {
-        let yaml = r#"
+        let yaml = r"
 workspaces:
   - name: demo
     tabs:
       - panes:
           - command: nvim
-"#;
+";
 
         let file = SpreadFile::from_str(yaml).unwrap();
 
@@ -342,14 +331,14 @@ workspaces:
 
     #[test]
     fn should_reject_config_given_unknown_split_direction() {
-        let yaml = r#"
+        let yaml = r"
 workspaces:
   - name: demo
     tabs:
       - panes:
           - command: nvim
             split: left
-"#;
+";
 
         let result = SpreadFile::from_str(yaml);
 
@@ -385,7 +374,7 @@ workspaces:
     fn should_include_file_path_in_error_when_config_file_is_missing() {
         let path = Path::new("/nonexistent/path/to/config.yaml");
 
-        let result = load_config(path);
+        let result = read_config(path);
 
         let err = result.unwrap_err();
         assert!(err.to_string().contains("/nonexistent/path/to/config.yaml"));
@@ -393,18 +382,19 @@ workspaces:
 
     #[test]
     fn should_load_spread_file_from_disk_given_multi_workspace_yaml() {
-        let yaml = r#"
+        let yaml = r"
 workspaces:
   - name: frontend
   - name: backend
-"#;
+";
         let path = std::env::temp_dir().join(format!(
             "herdr-spreader-test-{}-should_load_spread_file_from_disk_given_multi_workspace_yaml.yml",
             std::process::id()
         ));
         fs::write(&path, yaml).unwrap();
 
-        let file = load_config(&path).unwrap();
+        let yaml = read_config(&path).unwrap();
+        let file = SpreadFile::from_str(&yaml).unwrap();
 
         assert_eq!(file.workspaces.len(), 2);
 

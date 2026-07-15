@@ -31,7 +31,13 @@ main.rs ──▶ backend/cli.rs ──implements──▶ backend/mod.rs
 
 ```
 config.yaml (workspaces: list, required; config.yml also accepted)
-    │  config::load_config → fs::read_to_string + SpreadFile::from_str (serde_yaml_ng)
+    │  config::read_config → fs::read_to_string
+    ▼
+String (raw file contents, ownership kept by the caller)
+    │  (apply path) validate::validate_config(SourceFile { yaml, path })
+    │  → SpreadFile::from_str + validate (serde_yaml_ng)
+    │  — any finding (error or warning) stops processing (Err/exit 1);
+    │    only Ok proceeds to path resolution and the engine
     ▼
 SpreadFile { workspaces: Vec<Workspace> }  (raw, as written by the user)
     │  config::resolve_paths(file, env, invocation_cwd)
@@ -154,7 +160,7 @@ If you're touching path resolution, add a test for the *specific* combination yo
 
 Three layers, each targeting a different seam:
 
-1. **`config.rs` unit tests** — YAML parsing and path resolution, as plain data-in/data-out assertions. No filesystem or process access beyond `load_config`'s own file read.
+1. **`config.rs` unit tests** — YAML parsing and path resolution, as plain data-in/data-out assertions. No filesystem or process access beyond `read_config`'s own file read.
 2. **`engine.rs` unit tests** — drive `apply_workspace` (and `apply`'s cross-workspace focus-selection folding on top of it) against a hand-written `MockBackend` that just records every call it receives (`Vec<Call>`). This is what makes it possible to assert "for this YAML, exactly these `HerdrBackend` calls happen, in this order, with these ids" without needing herdr installed at all.
 3. **`tests/cli_backend_integration.rs`** — the one test that exercises the full `engine::apply` → `CliBackend` → subprocess path, against `tests/fixtures/fake-herdr.sh`, a script that logs the argv it's called with and echoes back canned JSON shaped like real herdr responses. This is what catches integration bugs the mock backend can't see (e.g. an argv-building bug in `backend/cli.rs` that both the mock and the real herdr would parse differently).
 

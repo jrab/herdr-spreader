@@ -69,8 +69,6 @@ fn normalize_path(path: &Path) -> PathBuf {
 pub enum EngineError {
     #[error(transparent)]
     Backend(#[from] BackendError),
-    #[error("wait_for was specified on a pane without a command")]
-    WaitForWithoutCommand,
 }
 
 /// Apply the workspace layout described by `file`, creating workspaces, tabs,
@@ -83,9 +81,7 @@ pub enum EngineError {
 ///
 /// # Errors
 ///
-/// Returns [`EngineError::Backend`] if any backend operation fails, or
-/// [`EngineError::WaitForWithoutCommand`] if a pane specifies `wait_for`
-/// without a `command`.
+/// Returns [`EngineError::Backend`] if any backend operation fails.
 pub fn apply(file: &SpreadFile, backend: &mut dyn HerdrBackend) -> Result<(), EngineError> {
     for ws in &file.workspaces {
         apply_workspace(ws, backend)?;
@@ -99,9 +95,7 @@ pub fn apply(file: &SpreadFile, backend: &mut dyn HerdrBackend) -> Result<(), En
 ///
 /// # Errors
 ///
-/// Returns [`EngineError::Backend`] if any backend operation fails, or
-/// [`EngineError::WaitForWithoutCommand`] if a pane specifies `wait_for`
-/// without a `command`.
+/// Returns [`EngineError::Backend`] if any backend operation fails.
 pub fn apply_workspace(ws: &Workspace, backend: &mut dyn HerdrBackend) -> Result<(), EngineError> {
     let first_pane_focus = ws
         .tabs
@@ -181,15 +175,10 @@ pub fn apply_workspace(ws: &Workspace, backend: &mut dyn HerdrBackend) -> Result
                 if let Some(wait_for) = &pane.wait_for {
                     backend.wait_output(&pane_id, wait_for)?;
                 }
-            } else {
-                if pane.wait_for.is_some() {
-                    return Err(EngineError::WaitForWithoutCommand);
-                }
-                if pane_index == 0
-                    && let Some(prefix) = cwd_env_prefix(resolved_cwd.as_deref(), &pane.env)
-                {
-                    backend.run(&pane_id, &prefix)?;
-                }
+            } else if pane_index == 0
+                && let Some(prefix) = cwd_env_prefix(resolved_cwd.as_deref(), &pane.env)
+            {
+                backend.run(&pane_id, &prefix)?;
             }
 
             previous_pane_id = pane_id;
@@ -757,34 +746,6 @@ mod tests {
                 },
             }
         );
-    }
-
-    #[test]
-    fn should_error_when_wait_for_is_set_on_a_pane_without_a_command() {
-        let config = Workspace {
-            name: "demo".to_string(),
-            tabs: vec![Tab {
-                label: None,
-                panes: vec![Pane {
-                    command: None,
-                    wait_for: Some(WaitFor {
-                        pattern: "ready".to_string(),
-                        timeout_ms: None,
-                    }),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let mut mock = MockBackend::default();
-
-        let result = engine::apply_workspace(&config, &mut mock);
-
-        assert!(matches!(
-            result,
-            Err(engine::EngineError::WaitForWithoutCommand)
-        ));
     }
 
     #[test]
