@@ -21,12 +21,14 @@
 //! (since `demo2` sets workspace-level `focus: true` and the first workspace
 //! sets pane-level `focus: true` on its first pane).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use herdr_spreader::backend::cli::CliBackend;
+use herdr_spreader::backend::{SplitOpts, TabOpts, WorkspaceOpts};
 use herdr_spreader::config::{Pane, SplitDirection, SpreadFile, Tab, WaitFor, Workspace};
-use herdr_spreader::engine;
+use herdr_spreader::engine::{self, BackendOp, PaneHandle};
 
 /// Serialises integration tests that write to the process-global
 /// `FAKE_HERDR_LOG` env var so they do not race.
@@ -109,7 +111,7 @@ fn should_thread_ids_and_apply_focus_via_create_flags_across_two_workspaces_agai
     }
 
     let file = build_spread_file();
-    let mut backend = CliBackend::new(fake_herdr_path());
+    let mut backend = CliBackend::new(fake_herdr_path(), None);
 
     engine::apply(&file, &mut backend).expect("apply against fake herdr should succeed");
 
@@ -174,7 +176,7 @@ fn should_focus_second_pane_when_focus_true_is_on_second_pane() {
     }
 
     let file = build_spread_file_with_focus_on_second_pane();
-    let mut backend = CliBackend::new(fake_herdr_path());
+    let mut backend = CliBackend::new(fake_herdr_path(), None);
 
     engine::apply(&file, &mut backend).expect("apply against fake herdr should succeed");
 
@@ -192,4 +194,109 @@ fn should_focus_second_pane_when_focus_true_is_on_second_pane() {
     assert_eq!(logged_lines, expected_lines);
 
     let _ = std::fs::remove_file(&log_path);
+}
+
+#[test]
+fn should_produce_expected_plan_for_two_workspace_fixture_before_execution() {
+    let file = build_spread_file();
+    let plan = engine::plan_file(&file);
+    let expected: Vec<BackendOp> = vec![
+        // --- demo ---
+        BackendOp::CreateWorkspace(WorkspaceOpts {
+            label: "demo".into(),
+            cwd: None,
+            env: BTreeMap::new(),
+            focus: true, // ws.focus == false OR first_pane.focus == true
+        }),
+        BackendOp::RenameFirstTab {
+            label: "editor".into(),
+        },
+        BackendOp::Run {
+            pane: PaneHandle::TabRoot(0),
+            command: "nvim".into(),
+        },
+        BackendOp::SplitPane {
+            from: PaneHandle::TabRoot(0),
+            into: PaneHandle::Split(1),
+            opts: SplitOpts {
+                direction: SplitDirection::Down,
+                ratio: Some(0.3),
+                cwd: None,
+                env: BTreeMap::new(),
+                focus: false,
+            },
+        },
+        BackendOp::Run {
+            pane: PaneHandle::Split(1),
+            command: "cargo watch -x test".into(),
+        },
+        BackendOp::WaitOutput {
+            pane: PaneHandle::Split(1),
+            wait: WaitFor {
+                pattern: "Compiling".into(),
+                timeout_ms: Some(10000),
+            },
+        },
+        BackendOp::CreateTab {
+            index: 1,
+            opts: TabOpts {
+                label: Some("server".into()),
+                cwd: None,
+                focus: false,
+            },
+        },
+        BackendOp::Run {
+            pane: PaneHandle::TabRoot(1),
+            command: "cargo run".into(),
+        },
+        // --- demo2 ---
+        BackendOp::CreateWorkspace(WorkspaceOpts {
+            label: "demo2".into(),
+            cwd: None,
+            env: BTreeMap::new(),
+            focus: true, // ws.focus == true
+        }),
+        BackendOp::Run {
+            pane: PaneHandle::TabRoot(0),
+            command: "htop".into(),
+        },
+    ];
+    assert_eq!(plan, expected);
+}
+
+#[test]
+fn should_produce_expected_plan_for_second_pane_focus_fixture_before_execution() {
+    let file = build_spread_file_with_focus_on_second_pane();
+    let plan = engine::plan_file(&file);
+    let expected: Vec<BackendOp> = vec![
+        BackendOp::CreateWorkspace(WorkspaceOpts {
+            label: "demo".into(),
+            cwd: None,
+            env: BTreeMap::new(),
+            focus: false, // ws.focus == false AND first_pane.focus == false
+        }),
+        BackendOp::RenameFirstTab {
+            label: "editor".into(),
+        },
+        BackendOp::Run {
+            pane: PaneHandle::TabRoot(0),
+            command: "nvim".into(),
+        },
+        BackendOp::SplitPane {
+            from: PaneHandle::TabRoot(0),
+            into: PaneHandle::Split(1),
+            opts: SplitOpts {
+                direction: SplitDirection::Right,
+                ratio: None,
+                cwd: None,
+                env: BTreeMap::new(),
+                focus: true,
+            },
+        },
+        BackendOp::Run {
+            pane: PaneHandle::Split(1),
+            command: "lazygit".into(),
+        },
+    ];
+    assert_eq!(plan, expected);
 }

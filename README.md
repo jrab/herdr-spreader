@@ -56,6 +56,7 @@ $ herdr-spreader apply
 - **Explicit focus control** — mark exactly which pane should end up focused after the layout is built.
 - **Runs as a herdr plugin or a standalone CLI** — invoke it from herdr's plugin menu, or run the binary directly against any config file.
 - **Strict config validation** — unknown YAML keys are rejected at parse time instead of being silently ignored, so typos in your config surface immediately.
+- **Dry-run mode** — `--dry-run` prints the operations that *would* be performed (workspace create, tab create, pane split, run, wait…) as a human-readable plan, without invoking `herdr` or touching your session. Useful for previewing a layout before applying it, or for sanity-checking a config you just edited.
 
 ## Installation
 
@@ -103,6 +104,7 @@ herdr-spreader apply [--file <path>]
 | Flag | Description |
 |---|---|
 | `-f, --file <path>` | Path to a layout YAML file. If omitted, searched in `$HERDR_PLUGIN_CONFIG_DIR/` (set automatically when run as a herdr plugin), then `$XDG_CONFIG_HOME/herdr-spreader/`, then `$HOME/.config/herdr-spreader/`. Each directory is checked for `config.yaml` then `config.yml`. Run `herdr plugin config-dir herdr-spreader` to see or create the plugin config directory. |
+| `--dry-run` | Print the plan of operations that would be performed (one `BackendOp` per line) without spawning `herdr` or modifying any workspace. Path resolution still runs, so the printed paths reflect your real `root`/`cwd`/`~` expansion — only execution is skipped. |
 
 ## Configuration reference
 

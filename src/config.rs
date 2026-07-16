@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Workspace {
     pub name: String,
@@ -38,7 +38,7 @@ impl SpreadFile {
     }
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Tab {
     pub label: Option<String>,
@@ -48,7 +48,7 @@ pub struct Tab {
     pub panes: Vec<Pane>,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Pane {
     pub command: Option<String>,
@@ -112,17 +112,10 @@ pub fn resolve_config_path(
     if let Some(path) = explicit {
         return Ok(path);
     }
-
-    for candidate in config_candidate_paths(env) {
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-
-    Err(ConfigError::NotFound)
+    find_first_existing(&candidate_paths(env)).ok_or(ConfigError::NotFound)
 }
 
-fn config_candidate_paths(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+pub(crate) fn candidate_paths(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let config_names = CONFIG_FILE_NAMES;
 
@@ -149,6 +142,10 @@ fn config_candidate_paths(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
     paths
 }
 
+pub(crate) fn find_first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|p| p.exists()).cloned()
+}
+
 /// Read a config file from disk into a `String`.
 ///
 /// # Errors
@@ -162,37 +159,59 @@ pub fn read_config(path: &Path) -> Result<String, ConfigError> {
 }
 
 #[must_use]
-pub fn resolve_paths(file: SpreadFile, env: &BTreeMap<String, String>, cwd: &Path) -> SpreadFile {
+pub fn resolve_paths(file: &SpreadFile, env: &BTreeMap<String, String>, cwd: &Path) -> SpreadFile {
     SpreadFile {
         workspaces: file
             .workspaces
-            .into_iter()
+            .iter()
             .map(|ws| resolve_workspace_paths(ws, env, cwd))
             .collect(),
     }
 }
 
 fn resolve_workspace_paths(
-    mut config: Workspace,
+    ws: &Workspace,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Workspace {
     // Default root to the invocation cwd so relative tab/pane cwd values always
     // have an absolute base to resolve against, instead of leaking a bare relative
     // path through to herdr or a shell `cd` when the config has no explicit root.
-    let root = config.root.take().unwrap_or_else(|| cwd.to_path_buf());
-    config.root = Some(expand_root_path(&root, env, cwd));
-    for tab in &mut config.tabs {
-        if let Some(tab_cwd) = tab.cwd.take() {
-            tab.cwd = Some(expand_tilde(&tab_cwd, env));
-        }
-        for pane in &mut tab.panes {
-            if let Some(pane_cwd) = pane.cwd.take() {
-                pane.cwd = Some(expand_tilde(&pane_cwd, env));
-            }
-        }
+    let root = ws.root.as_ref().map_or_else(
+        || cwd.to_path_buf(),
+        |root| expand_root_path(root, env, cwd),
+    );
+
+    Workspace {
+        name: ws.name.clone(),
+        root: Some(root),
+        env: ws.env.clone(),
+        tabs: ws
+            .tabs
+            .iter()
+            .map(|tab| Tab {
+                label: tab.label.clone(),
+                cwd: tab.cwd.as_ref().map(|tab_cwd| expand_tilde(tab_cwd, env)),
+                panes: tab
+                    .panes
+                    .iter()
+                    .map(|pane| Pane {
+                        command: pane.command.clone(),
+                        cwd: pane
+                            .cwd
+                            .as_ref()
+                            .map(|pane_cwd| expand_tilde(pane_cwd, env)),
+                        env: pane.env.clone(),
+                        split: pane.split,
+                        ratio: pane.ratio,
+                        wait_for: pane.wait_for.clone(),
+                        focus: pane.focus,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        focus: ws.focus,
     }
-    config
 }
 
 fn expand_root_path(path: &Path, env: &BTreeMap<String, String>, cwd: &Path) -> PathBuf {
@@ -536,6 +555,50 @@ workspaces:
     }
 
     #[test]
+    fn should_list_all_candidate_paths_for_plugin_xdg_and_home_in_order_without_touching_the_filesystem()
+     {
+        let mut env = BTreeMap::new();
+        env.insert("HERDR_PLUGIN_CONFIG_DIR".to_string(), "/cfg".to_string());
+        env.insert("XDG_CONFIG_HOME".to_string(), "/xdg".to_string());
+        env.insert("HOME".to_string(), "/home/demo".to_string());
+        let paths = candidate_paths(&env);
+        assert_eq!(
+            paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                "/cfg/config.yaml",
+                "/cfg/config.yml",
+                "/xdg/herdr-spreader/config.yaml",
+                "/xdg/herdr-spreader/config.yml",
+                "/home/demo/.config/herdr-spreader/config.yaml",
+                "/home/demo/.config/herdr-spreader/config.yml",
+            ]
+        );
+    }
+
+    #[test]
+    fn should_return_first_existing_candidate_from_a_list() {
+        let tmp = std::env::temp_dir().join(format!(
+            "herdr-spreader-test-{}-find-first-existing",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.yaml"), "").unwrap();
+        let missing = tmp.join("nonexistent_dir").join("config.yaml");
+        let found = find_first_existing(&[
+            missing.clone(),
+            tmp.join("config.yaml"),
+            tmp.join("config.yml"),
+        ]);
+        assert_eq!(found, Some(tmp.join("config.yaml")));
+        let none = find_first_existing(&[missing.clone(), tmp.join("also-missing.yaml")]);
+        assert!(none.is_none());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
     fn should_expand_home_relative_root_given_tilde_slash_prefix() {
         let config = Workspace {
             name: "demo".to_string(),
@@ -545,7 +608,7 @@ workspaces:
         let mut env = BTreeMap::new();
         env.insert("HOME".to_string(), "/home/demo".to_string());
 
-        let resolved = resolve_workspace_paths(config, &env, Path::new("/irrelevant"));
+        let resolved = resolve_workspace_paths(&config, &env, Path::new("/irrelevant"));
 
         assert_eq!(
             resolved.root,
@@ -563,7 +626,7 @@ workspaces:
         let mut env = BTreeMap::new();
         env.insert("HOME".to_string(), "/home/demo".to_string());
 
-        let resolved = resolve_workspace_paths(config, &env, Path::new("/irrelevant"));
+        let resolved = resolve_workspace_paths(&config, &env, Path::new("/irrelevant"));
 
         assert_eq!(resolved.root, Some(PathBuf::from("/home/demo")));
     }
@@ -576,7 +639,7 @@ workspaces:
             ..Default::default()
         };
 
-        let resolved = resolve_workspace_paths(config, &BTreeMap::new(), Path::new("/irrelevant"));
+        let resolved = resolve_workspace_paths(&config, &BTreeMap::new(), Path::new("/irrelevant"));
 
         assert_eq!(resolved.root, Some(PathBuf::from("/proj")));
     }
@@ -589,7 +652,7 @@ workspaces:
             ..Default::default()
         };
 
-        let resolved = resolve_workspace_paths(config, &BTreeMap::new(), Path::new("/home/demo"));
+        let resolved = resolve_workspace_paths(&config, &BTreeMap::new(), Path::new("/home/demo"));
 
         assert_eq!(resolved.root, Some(PathBuf::from("/home/demo/proj")));
     }
@@ -620,7 +683,7 @@ workspaces:
         let mut env = BTreeMap::new();
         env.insert("HOME".to_string(), "/home/demo".to_string());
 
-        let resolved = resolve_workspace_paths(config, &env, Path::new("/irrelevant"));
+        let resolved = resolve_workspace_paths(&config, &env, Path::new("/irrelevant"));
 
         assert_eq!(resolved.tabs[0].cwd, Some(PathBuf::from("/home/demo/logs")));
         assert_eq!(
@@ -646,10 +709,38 @@ workspaces:
         };
 
         let resolved =
-            resolve_workspace_paths(config, &BTreeMap::new(), Path::new("/home/demo/project"));
+            resolve_workspace_paths(&config, &BTreeMap::new(), Path::new("/home/demo/project"));
 
         assert_eq!(resolved.root, Some(PathBuf::from("/home/demo/project")));
         assert_eq!(resolved.tabs[0].cwd, Some(PathBuf::from("svc")));
+    }
+
+    #[test]
+    fn should_resolve_workspace_paths_without_mutating_the_input_workspace() {
+        let ws = Workspace {
+            name: "demo".to_string(),
+            root: Some(PathBuf::from("~/code")),
+            tabs: vec![Tab {
+                cwd: Some(PathBuf::from("./src")),
+                panes: vec![Pane {
+                    cwd: Some(PathBuf::from("./inner")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let snapshot = ws.clone();
+        let mut env = BTreeMap::new();
+        env.insert("HOME".to_string(), "/home/demo".to_string());
+        let resolved = resolve_workspace_paths(&ws, &env, Path::new("/cwd"));
+        assert_eq!(ws, snapshot, "input workspace must not be mutated");
+        assert_eq!(resolved.root, Some(PathBuf::from("/home/demo/code")));
+        assert_eq!(
+            resolved.tabs[0].panes[0].cwd,
+            Some(PathBuf::from("./inner"))
+        );
+        assert_eq!(resolved.tabs[0].cwd, Some(PathBuf::from("./src")));
     }
 
     #[test]
@@ -671,7 +762,7 @@ workspaces:
         let mut env = BTreeMap::new();
         env.insert("HOME".to_string(), "/home/demo".to_string());
 
-        let resolved = resolve_paths(file, &env, Path::new("/home/demo/base"));
+        let resolved = resolve_paths(&file, &env, Path::new("/home/demo/base"));
 
         assert_eq!(
             resolved.workspaces[0].root,
@@ -698,7 +789,7 @@ workspaces:
             ],
         };
 
-        let resolved = resolve_paths(file, &BTreeMap::new(), Path::new("/home/demo/project"));
+        let resolved = resolve_paths(&file, &BTreeMap::new(), Path::new("/home/demo/project"));
 
         assert_eq!(
             resolved.workspaces[0].root,
