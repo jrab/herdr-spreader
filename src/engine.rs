@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 use crate::backend::{BackendError, HerdrBackend, SplitOpts, TabOpts, WorkspaceOpts};
-use crate::config::{SplitDirection, SpreadFile, WaitFor, Workspace};
+use crate::config::{LayoutNode, Pane, SplitDirection, SpreadFile, Tab, WaitFor, Workspace};
 
 fn resolve_cwd(
     root: Option<&Path>,
@@ -189,11 +189,7 @@ pub fn apply(file: &SpreadFile, backend: &mut dyn HerdrBackend) -> Result<(), En
 
 #[must_use]
 pub fn plan_workspace(ws: &Workspace) -> Vec<BackendOp> {
-    let first_pane_focus = ws
-        .tabs
-        .first()
-        .and_then(|t| t.panes.first())
-        .is_some_and(|p| p.focus);
+    let first_pane_focus = ws.tabs.first().is_some_and(tab_contains_focus);
 
     let mut ops = Vec::new();
     ops.push(BackendOp::CreateWorkspace(WorkspaceOpts {
@@ -215,7 +211,7 @@ pub fn plan_workspace(ws: &Workspace) -> Vec<BackendOp> {
                 });
             }
         } else {
-            let first_pane_focus = tab.panes.first().is_some_and(|p| p.focus);
+            let first_pane_focus = tab_contains_focus(tab);
             ops.push(BackendOp::CreateTab {
                 index: tab_index,
                 opts: TabOpts {
@@ -224,6 +220,20 @@ pub fn plan_workspace(ws: &Workspace) -> Vec<BackendOp> {
                     focus: first_pane_focus,
                 },
             });
+        }
+
+        if let Some(layout) = &tab.layout {
+            plan_layout_node(
+                layout,
+                root_handle,
+                true,
+                tab_index,
+                ws,
+                tab,
+                &mut next_split,
+                &mut ops,
+            );
+            continue;
         }
 
         let mut previous_handle = root_handle;
@@ -289,6 +299,104 @@ pub fn plan_workspace(ws: &Workspace) -> Vec<BackendOp> {
     }
 
     ops
+}
+
+fn tab_contains_focus(tab: &Tab) -> bool {
+    tab.layout.as_ref().map_or_else(
+        || tab.panes.first().is_some_and(|pane| pane.focus),
+        layout_contains_focus,
+    )
+}
+
+fn layout_contains_focus(layout: &LayoutNode) -> bool {
+    match layout {
+        LayoutNode::Pane(leaf) => leaf.pane.focus,
+        LayoutNode::Split(node) => node.children.iter().any(layout_contains_focus),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_layout_node(
+    layout: &LayoutNode,
+    handle: PaneHandle,
+    is_tab_root: bool,
+    tab_index: usize,
+    ws: &Workspace,
+    tab: &Tab,
+    next_split: &mut usize,
+    ops: &mut Vec<BackendOp>,
+) {
+    match layout {
+        LayoutNode::Pane(leaf) => {
+            plan_layout_pane(&leaf.pane, handle, is_tab_root, tab_index, ws, tab, ops);
+        }
+        LayoutNode::Split(node) => {
+            let [first, second] = node.children.as_slice() else {
+                return;
+            };
+            let new_handle = PaneHandle::Split(*next_split);
+            *next_split += 1;
+            ops.push(BackendOp::SplitPane {
+                from: handle.clone(),
+                into: new_handle.clone(),
+                opts: SplitOpts {
+                    direction: node.split,
+                    ratio: node.ratio,
+                    cwd: resolve_cwd(ws.root.as_deref(), tab.cwd.as_deref(), None),
+                    env: BTreeMap::new(),
+                    focus: layout_contains_focus(second),
+                },
+            });
+            plan_layout_node(
+                first,
+                handle,
+                is_tab_root,
+                tab_index,
+                ws,
+                tab,
+                next_split,
+                ops,
+            );
+            plan_layout_node(
+                second, new_handle, false, tab_index, ws, tab, next_split, ops,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_layout_pane(
+    pane: &Pane,
+    handle: PaneHandle,
+    is_tab_root: bool,
+    tab_index: usize,
+    ws: &Workspace,
+    tab: &Tab,
+    ops: &mut Vec<BackendOp>,
+) {
+    let needs_cwd_override =
+        pane.cwd.is_some() || (is_tab_root && tab_index == 0 && tab.cwd.is_some());
+    let resolved_cwd = needs_cwd_override
+        .then(|| resolve_cwd(ws.root.as_deref(), tab.cwd.as_deref(), pane.cwd.as_deref()))
+        .flatten();
+
+    if let Some(command) = &pane.command {
+        ops.push(BackendOp::Run {
+            pane: handle.clone(),
+            command: wrap_command_with_cwd_and_env(command, resolved_cwd.as_deref(), &pane.env),
+        });
+        if let Some(wait_for) = &pane.wait_for {
+            ops.push(BackendOp::WaitOutput {
+                pane: handle,
+                wait: wait_for.clone(),
+            });
+        }
+    } else if let Some(prefix) = cwd_env_prefix(resolved_cwd.as_deref(), &pane.env) {
+        ops.push(BackendOp::Run {
+            pane: handle,
+            command: prefix,
+        });
+    }
 }
 
 #[must_use]
@@ -747,6 +855,7 @@ mod tests {
                             command: Some("cargo run".to_string()),
                             ..Default::default()
                         }],
+                        layout: None,
                     },
                 ],
                 ..Default::default()
@@ -991,6 +1100,7 @@ mod tests {
                         env: pane_env,
                         ..Default::default()
                     }],
+                    layout: None,
                 }],
                 ..Default::default()
             };
@@ -1030,6 +1140,7 @@ mod tests {
                         env: pane_env,
                         ..Default::default()
                     }],
+                    layout: None,
                 }],
                 ..Default::default()
             };
@@ -1101,6 +1212,7 @@ mod tests {
                             command: Some("cargo run".to_string()),
                             ..Default::default()
                         }],
+                        layout: None,
                     },
                 ],
                 ..Default::default()

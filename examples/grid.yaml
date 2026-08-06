@@ -1,0 +1,22 @@
+workspaces:
+  - name: grid
+    tabs:
+      - label: main
+        layout:
+          split: right
+          ratio: 0.5
+          children:
+            - split: down
+              ratio: 0.5
+              children:
+                - pane:
+                    command: nvim
+                    focus: true
+                - pane:
+                    command: cargo test
+            - split: down
+              ratio: 0.5
+              children:
+                - pane:
+                    command: cargo run
+                - pane: {}

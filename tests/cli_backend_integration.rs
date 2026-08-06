@@ -71,6 +71,7 @@ fn build_spread_file() -> SpreadFile {
                                 ..Default::default()
                             },
                         ],
+                        layout: None,
                     },
                     Tab {
                         label: Some("server".to_string()),
@@ -79,6 +80,7 @@ fn build_spread_file() -> SpreadFile {
                             command: Some("cargo run".to_string()),
                             ..Default::default()
                         }],
+                        layout: None,
                     },
                 ],
                 ..Default::default()
@@ -93,6 +95,7 @@ fn build_spread_file() -> SpreadFile {
                         command: Some("htop".to_string()),
                         ..Default::default()
                     }],
+                    layout: None,
                 }],
                 ..Default::default()
             },

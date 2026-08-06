@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::config::SpreadFile;
+use crate::config::{LayoutNode, Pane, SpreadFile};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Severity {
@@ -70,7 +70,17 @@ pub(crate) fn validate(file: &SpreadFile) -> Vec<ValidationFinding> {
         }
 
         for tab in &ws.tabs {
-            if tab.panes.is_empty() {
+            if !tab.panes.is_empty() && tab.layout.is_some() {
+                findings.push(ValidationFinding {
+                    severity: Severity::Error,
+                    message: format!(
+                        "tab '{}' in workspace '{}' must use either `panes` or `layout`, not both",
+                        tab.label.as_deref().unwrap_or("(unnamed)"),
+                        ws.name
+                    ),
+                });
+            }
+            if tab.panes.is_empty() && tab.layout.is_none() {
                 findings.push(ValidationFinding {
                     severity: Severity::Warning,
                     message: format!(
@@ -82,27 +92,10 @@ pub(crate) fn validate(file: &SpreadFile) -> Vec<ValidationFinding> {
             }
 
             for pane in &tab.panes {
-                if let Some(ratio) = pane.ratio
-                    && (ratio <= 0.0 || ratio >= 1.0)
-                {
-                    findings.push(ValidationFinding {
-                        severity: Severity::Error,
-                        message: format!(
-                            "pane ratio {ratio} in workspace '{}' must be between 0 and 1 (exclusive)",
-                            ws.name
-                        ),
-                    });
-                }
-
-                if pane.wait_for.is_some() && pane.command.is_none() {
-                    findings.push(ValidationFinding {
-                        severity: Severity::Error,
-                        message: format!(
-                            "wait_for was specified on a pane without a command in workspace '{}'",
-                            ws.name
-                        ),
-                    });
-                }
+                validate_pane(pane, &ws.name, &mut findings);
+            }
+            if let Some(layout) = &tab.layout {
+                validate_layout(layout, &ws.name, &mut findings);
             }
         }
     }
@@ -117,6 +110,51 @@ pub(crate) fn validate(file: &SpreadFile) -> Vec<ValidationFinding> {
     }
 
     findings
+}
+
+fn validate_ratio(ratio: Option<f64>, workspace: &str, findings: &mut Vec<ValidationFinding>) {
+    if let Some(ratio) = ratio
+        && (ratio <= 0.0 || ratio >= 1.0)
+    {
+        findings.push(ValidationFinding {
+            severity: Severity::Error,
+            message: format!(
+                "pane ratio {ratio} in workspace '{workspace}' must be between 0 and 1 (exclusive)"
+            ),
+        });
+    }
+}
+
+fn validate_pane(pane: &Pane, workspace: &str, findings: &mut Vec<ValidationFinding>) {
+    validate_ratio(pane.ratio, workspace, findings);
+    if pane.wait_for.is_some() && pane.command.is_none() {
+        findings.push(ValidationFinding {
+            severity: Severity::Error,
+            message: format!(
+                "wait_for was specified on a pane without a command in workspace '{workspace}'"
+            ),
+        });
+    }
+}
+
+fn validate_layout(layout: &LayoutNode, workspace: &str, findings: &mut Vec<ValidationFinding>) {
+    match layout {
+        LayoutNode::Pane(leaf) => validate_pane(&leaf.pane, workspace, findings),
+        LayoutNode::Split(node) => {
+            validate_ratio(node.ratio, workspace, findings);
+            if node.children.len() != 2 {
+                findings.push(ValidationFinding {
+                    severity: Severity::Error,
+                    message: format!(
+                        "layout split in workspace '{workspace}' must have exactly 2 children"
+                    ),
+                });
+            }
+            for child in &node.children {
+                validate_layout(child, workspace, findings);
+            }
+        }
+    }
 }
 
 pub fn print_findings(findings: &[ValidationFinding]) {

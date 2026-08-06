@@ -46,6 +46,29 @@ pub struct Tab {
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub panes: Vec<Pane>,
+    #[serde(default)]
+    pub layout: Option<LayoutNode>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum LayoutNode {
+    Pane(LayoutPane),
+    Split(LayoutSplit),
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutPane {
+    pub pane: Pane,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutSplit {
+    pub split: SplitDirection,
+    pub ratio: Option<f64>,
+    pub children: Vec<LayoutNode>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
@@ -208,9 +231,42 @@ fn resolve_workspace_paths(
                         focus: pane.focus,
                     })
                     .collect(),
+                layout: tab
+                    .layout
+                    .as_ref()
+                    .map(|layout| resolve_layout_paths(layout, env)),
             })
             .collect(),
         focus: ws.focus,
+    }
+}
+
+fn resolve_layout_paths(layout: &LayoutNode, env: &BTreeMap<String, String>) -> LayoutNode {
+    match layout {
+        LayoutNode::Pane(leaf) => LayoutNode::Pane(LayoutPane {
+            pane: Pane {
+                command: leaf.pane.command.clone(),
+                cwd: leaf
+                    .pane
+                    .cwd
+                    .as_ref()
+                    .map(|pane_cwd| expand_tilde(pane_cwd, env)),
+                env: leaf.pane.env.clone(),
+                split: leaf.pane.split,
+                ratio: leaf.pane.ratio,
+                wait_for: leaf.pane.wait_for.clone(),
+                focus: leaf.pane.focus,
+            },
+        }),
+        LayoutNode::Split(node) => LayoutNode::Split(LayoutSplit {
+            split: node.split,
+            ratio: node.ratio,
+            children: node
+                .children
+                .iter()
+                .map(|child| resolve_layout_paths(child, env))
+                .collect(),
+        }),
     }
 }
 
@@ -677,6 +733,7 @@ workspaces:
                         ..Default::default()
                     },
                 ],
+                layout: None,
             }],
             ..Default::default()
         };
@@ -704,6 +761,7 @@ workspaces:
                 label: None,
                 cwd: Some(PathBuf::from("svc")),
                 panes: vec![],
+                layout: None,
             }],
             ..Default::default()
         };

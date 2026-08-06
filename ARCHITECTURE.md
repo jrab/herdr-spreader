@@ -64,6 +64,12 @@ Each stage is a separate module and is unit-tested independently; only the final
 
 herdr's own object model is workspace → tab → pane, and the config types mirror it directly: `SpreadFile` holds a list of `Workspace`s (one YAML file can now describe several workspaces, not just one), each `Workspace` has `tabs`, and each tab has `panes` (→ panes within that tab). This is intentionally the same shape as tmuxinator's `windows`/`panes` (herdr calls the same concept a "tab" rather than a "window"), since that's the layout DSL most users porting a config will already know.
 
+Tabs support either the original linear `panes` list or a recursive binary
+`layout` tree. A tree split keeps the current pane for its first child and
+creates a new pane for its second child, then recursively plans both branches.
+This lets the planner split any previously created branch and build balanced
+grids while keeping existing configuration files valid.
+
 The one wrinkle: `herdr workspace create` and `herdr tab create` don't just create an empty tab — they *also* create that tab's first ("root") pane, in the same call. That single fact drives most of the complexity in `engine.rs`, described next.
 
 ## `engine.rs`: why "first panes" are special-cased
@@ -71,7 +77,11 @@ The one wrinkle: `herdr workspace create` and `herdr tab create` don't just crea
 `engine::plan_file(&file)` is a pure Calculation: it loops over `file.workspaces` in order, calling `plan_workspace(workspace)` for each one, and concatenates the resulting `Vec<BackendOp>` into a single flat plan for the whole file. All of the interesting per-layout logic lives in `plan_workspace`, which walks `workspace.tabs[*].panes[*]` and, for each pane, decides which `BackendOp` creates it:
 
 - **A tab's first pane** (`pane_index == 0`) is never created directly — it's the root pane that came back from `create_workspace` (for the first tab) or `create_tab` (for every other tab). There is no `HerdrBackend::create_first_pane` call; it already exists.
-- **Every other pane** is created by `split_pane`, splitting off the previous pane in the tab.
+- **Every other pane in a legacy list** is created by `split_pane`, splitting
+  off the previous pane in the tab.
+- **Every split node in a layout tree** splits its branch's current pane. The
+  original pane is threaded into the first child and the returned pane ID into
+  the second child.
 
 This asymmetry matters because `create_workspace`, `create_tab`, and `split_pane` each accept a `cwd`/`env` at creation time — but a first pane, having no creation call of its own, has no way to receive a pane-specific `cwd` or `env` through the API. The fix (after several review rounds got this wrong — see [History of the cwd/env bug](#history-of-the-cwden-bug)) is: when a first pane needs a `cwd` or `env` beyond what its workspace/tab baseline already gives it, `engine.rs` prefixes its `run` command with a shell snippet:
 

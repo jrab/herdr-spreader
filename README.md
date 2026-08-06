@@ -49,7 +49,8 @@ $ herdr-spreader apply
 ## Features
 
 - **Declarative YAML layouts** — describe tabs and panes once, apply them as many times as you want.
-- **Nested pane splits** — split panes `right` or `down` with an optional `ratio`, chained from the previous pane, so you can build arbitrarily deep layouts.
+- **Arbitrary layout trees** — recursively split either branch to build balanced grids and deeply nested layouts.
+- **Backward-compatible pane chains** — existing `panes` lists still split from the previously created pane.
 - **Per-pane and per-tab working directories** — set a `root` for the whole layout and override it per tab or per pane; relative paths resolve against their parent, `~` expands to your home directory.
 - **Environment variables at every level** — set env vars for the whole workspace or scope them to a single pane.
 - **Startup commands with synchronization** — run a command in each pane, and optionally `wait_for` a pattern in its output (with a timeout) before moving on — handy for "don't run the tests until the dev server says it's ready."
@@ -132,7 +133,40 @@ A layout file has four levels: the **file** (top level), **workspaces**, **tabs*
 |---|---|---|
 | `label` | string | Tab name. The first tab renames herdr's default tab instead of creating a new one. |
 | `cwd` | path | Working directory for this tab's panes, relative to `root` unless it starts with `~` or `/`. |
-| `panes` | list of [Pane](#pane) | Panes to create in this tab, in order. The first pane reuses the tab's root pane; every subsequent pane is created by splitting the previous one. |
+| `panes` | list of [Pane](#pane) | Backward-compatible pane chain. The first pane reuses the tab's root pane; every subsequent pane splits the previous one. Mutually exclusive with `layout`. |
+| `layout` | [Layout node](#layout-trees) | Recursive pane layout capable of splitting either branch. Mutually exclusive with `panes`. |
+
+### Layout trees
+
+A layout is either a leaf (`pane`) or a binary split with exactly two
+`children`. The first child keeps the existing pane and the second child gets
+the new pane created by `split`. Children may themselves be splits, allowing
+balanced grids and arbitrary nested arrangements.
+
+```yaml
+layout:
+  split: right
+  ratio: 0.5
+  children:
+    - split: down
+      ratio: 0.5
+      children:
+        - pane:
+            command: nvim
+            focus: true
+        - pane:
+            command: cargo test
+    - split: down
+      ratio: 0.5
+      children:
+        - pane:
+            command: cargo run
+        - pane: {}
+```
+
+This produces a true 2×2 grid. Leaf `pane` objects accept the same `command`,
+`cwd`, `env`, `wait_for`, and `focus` keys documented below. See
+[`examples/grid.yaml`](./examples/grid.yaml) for a complete configuration.
 
 ### Pane
 

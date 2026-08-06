@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Add recursive `layout` trees for arbitrary nested pane arrangements.
+- Add true balanced 2×2 grid support and a complete grid example.
+- Preserve the existing chained `panes` configuration format.
+- Validate binary split arity and reject tabs that mix `panes` and `layout`.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
