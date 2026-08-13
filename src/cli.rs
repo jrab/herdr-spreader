@@ -20,6 +20,18 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    ApplyExisting {
+        #[arg(long, short)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        workspace_id: String,
+        #[arg(long)]
+        tab_id: String,
+        #[arg(long)]
+        root_pane_id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[cfg(test)]
@@ -92,6 +104,34 @@ mod tests {
         assert!(
             result.is_err(),
             "validate subcommand should no longer be parsed"
+        );
+    }
+
+    #[test]
+    fn should_parse_apply_existing_with_required_target_ids() {
+        let cli = Cli::try_parse_from([
+            "herdr-spreader",
+            "apply-existing",
+            "--file",
+            "./spread.yml",
+            "--workspace-id",
+            "w2",
+            "--tab-id",
+            "w2:t1",
+            "--root-pane-id",
+            "w2:p1",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.command,
+            Command::ApplyExisting {
+                file: Some(PathBuf::from("./spread.yml")),
+                workspace_id: "w2".into(),
+                tab_id: "w2:t1".into(),
+                root_pane_id: "w2:p1".into(),
+                dry_run: false,
+            }
         );
     }
 }

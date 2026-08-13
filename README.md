@@ -100,12 +100,19 @@ This works outside of a herdr session too, as long as a herdr server is already 
 
 ```bash
 herdr-spreader apply [--file <path>]
+herdr-spreader apply-existing --workspace-id <id> --tab-id <id> --root-pane-id <id> [--file <path>]
 ```
 
 | Flag | Description |
 |---|---|
 | `-f, --file <path>` | Path to a layout YAML file. If omitted, searched in `$HERDR_PLUGIN_CONFIG_DIR/` (set automatically when run as a herdr plugin), then `$XDG_CONFIG_HOME/herdr-spreader/`, then `$HOME/.config/herdr-spreader/`. Each directory is checked for `config.yaml` then `config.yml`. Run `herdr plugin config-dir herdr-spreader` to see or create the plugin config directory. |
 | `--dry-run` | Print the plan of operations that would be performed (one `BackendOp` per line) without spawning `herdr` or modifying any workspace. Path resolution still runs, so the printed paths reflect your real `root`/`cwd`/`~` expansion — only execution is skipped. |
+
+`apply-existing` requires a config containing exactly one workspace. It reuses
+the supplied workspace's first tab and root pane, then creates the configured
+tabs, splits, commands, and focus state without creating a duplicate workspace.
+This is intended for integrations that already created a Herdr workspace and
+can pass through the IDs returned by that operation.
 
 ## Configuration reference
 

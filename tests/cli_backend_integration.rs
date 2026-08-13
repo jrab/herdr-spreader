@@ -303,3 +303,54 @@ fn should_produce_expected_plan_for_second_pane_focus_fixture_before_execution()
     ];
     assert_eq!(plan, expected);
 }
+
+#[test]
+fn should_apply_nested_layout_to_existing_workspace_without_creating_another_workspace() {
+    let _lock = FAKE_HERDR_LOCK.lock().unwrap();
+    let log_path =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fake_herdr_log_apply_existing.txt");
+    let _ = std::fs::remove_file(&log_path);
+    unsafe {
+        std::env::set_var("FAKE_HERDR_LOG", &log_path);
+    }
+
+    let file = SpreadFile::from_str(
+        r"
+workspaces:
+  - name: default
+    tabs:
+      - label: main
+        layout:
+          split: right
+          ratio: 0.5
+          children:
+            - split: down
+              ratio: 0.5
+              children:
+                - pane:
+                    focus: true
+                - pane: {}
+            - pane: {}
+",
+    )
+    .unwrap();
+    let target = engine::ExistingWorkspace {
+        workspace_id: "w9".into(),
+        tab_id: "w9:t1".into(),
+        root_pane_id: "w9:p1".into(),
+    };
+    let mut backend = CliBackend::new(fake_herdr_path(), None);
+
+    engine::apply_to_existing(&file.workspaces[0], &target, &mut backend).unwrap();
+
+    let log_contents = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(
+        log_contents.lines().collect::<Vec<_>>(),
+        vec![
+            "tab rename w9:t1 main",
+            "pane split w9:p1 --direction right --ratio 0.5 --no-focus",
+            "pane split w9:p1 --direction down --ratio 0.5 --no-focus",
+        ]
+    );
+    let _ = std::fs::remove_file(&log_path);
+}

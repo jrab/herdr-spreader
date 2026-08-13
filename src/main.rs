@@ -53,5 +53,58 @@ fn main() -> anyhow::Result<()> {
 
             Ok(())
         }
+        Command::ApplyExisting {
+            file,
+            workspace_id,
+            tab_id,
+            root_pane_id,
+            dry_run,
+        } => {
+            let config_path = resolve_config_path(file, &env)?;
+            let contents = read_config(&config_path)?;
+            let spread_file = match validate::validate_config(validate::SourceFile {
+                yaml: &contents,
+                path: &config_path,
+            }) {
+                Ok(f) => f,
+                Err(findings) => {
+                    validate::print_findings(&findings);
+                    std::process::exit(1);
+                }
+            };
+            let [workspace] = spread_file.workspaces.as_slice() else {
+                anyhow::bail!("apply-existing requires a config containing exactly one workspace");
+            };
+
+            let bin = CliBackend::resolve_bin(&env);
+            let socket_path = env.get("HERDR_SOCKET_PATH").map(PathBuf::from);
+            let mut backend = CliBackend::new(bin, socket_path);
+            let cwd = backend
+                .query_pane_cwd(&root_pane_id)
+                .unwrap_or(std::env::current_dir()?);
+            let resolved = resolve_paths(
+                &herdr_spreader::config::SpreadFile {
+                    workspaces: vec![workspace.clone()],
+                },
+                &env,
+                &cwd,
+            );
+            let workspace = &resolved.workspaces[0];
+            let target = engine::ExistingWorkspace {
+                workspace_id,
+                tab_id,
+                root_pane_id,
+            };
+
+            if dry_run {
+                for op in engine::plan_existing_workspace(workspace) {
+                    println!("{}", engine::render_op(&op));
+                }
+                return Ok(());
+            }
+
+            engine::apply_to_existing(workspace, &target, &mut backend)?;
+            Ok(())
+        }
     }
 }

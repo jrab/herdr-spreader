@@ -1,10 +1,10 @@
 [package]
 name = "herdr-spreader"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "MIT"
 description = "Apply tmuxinator-style project layouts to herdr from a YAML file"
-repository = "https://github.com/yuk1ty/herdr-spreader"
+repository = "https://github.com/jrab/herdr-spreader"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }

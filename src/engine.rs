@@ -111,6 +111,23 @@ struct Executor {
     panes: HashMap<PaneHandle, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingWorkspace {
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub root_pane_id: String,
+}
+
+impl Executor {
+    fn in_existing_workspace(target: &ExistingWorkspace) -> Self {
+        Self {
+            workspace_id: Some(target.workspace_id.clone()),
+            tab0_id: Some(target.tab_id.clone()),
+            panes: HashMap::from([(PaneHandle::TabRoot(0), target.root_pane_id.clone())]),
+        }
+    }
+}
+
 /// Execute a plan of backend operations, threading the real ids returned by the
 /// backend into the panes referenced by later operations.
 ///
@@ -124,7 +141,14 @@ struct Executor {
 /// is used before it is produced (for example, `RenameFirstTab` before
 /// `CreateWorkspace`).
 pub fn execute_plan(plan: &[BackendOp], backend: &mut dyn HerdrBackend) -> Result<(), EngineError> {
-    let mut ex = Executor::default();
+    execute_plan_with_executor(plan, backend, Executor::default())
+}
+
+fn execute_plan_with_executor(
+    plan: &[BackendOp],
+    backend: &mut dyn HerdrBackend,
+    mut ex: Executor,
+) -> Result<(), EngineError> {
     for op in plan {
         match op {
             BackendOp::CreateWorkspace(opts) => {
@@ -185,6 +209,24 @@ pub fn execute_plan(plan: &[BackendOp], backend: &mut dyn HerdrBackend) -> Resul
 /// Returns [`EngineError::Backend`] if any backend operation fails.
 pub fn apply(file: &SpreadFile, backend: &mut dyn HerdrBackend) -> Result<(), EngineError> {
     execute_plan(&plan_file(file), backend)
+}
+
+/// Apply one configured workspace to an existing workspace's first tab and
+/// root pane instead of creating another workspace.
+///
+/// # Errors
+///
+/// Returns [`EngineError::Backend`] if any backend operation fails.
+pub fn apply_to_existing(
+    ws: &Workspace,
+    target: &ExistingWorkspace,
+    backend: &mut dyn HerdrBackend,
+) -> Result<(), EngineError> {
+    execute_plan_with_executor(
+        &plan_existing_workspace(ws),
+        backend,
+        Executor::in_existing_workspace(target),
+    )
 }
 
 #[must_use]
@@ -298,6 +340,15 @@ pub fn plan_workspace(ws: &Workspace) -> Vec<BackendOp> {
         }
     }
 
+    ops
+}
+
+#[must_use]
+pub fn plan_existing_workspace(ws: &Workspace) -> Vec<BackendOp> {
+    let mut ops = plan_workspace(ws);
+    if matches!(ops.first(), Some(BackendOp::CreateWorkspace(_))) {
+        ops.remove(0);
+    }
     ops
 }
 
@@ -758,6 +809,44 @@ mod tests {
             let mut rec = RecordingBackend::default();
             engine::execute_plan(&plan, &mut rec).unwrap();
             assert!(rec.log.is_empty());
+        }
+
+        #[test]
+        fn should_apply_splits_to_supplied_existing_root_without_creating_workspace() {
+            let ws = Workspace {
+                name: "ignored".into(),
+                tabs: vec![Tab {
+                    layout: Some(crate::config::LayoutNode::Split(
+                        crate::config::LayoutSplit {
+                            split: SplitDirection::Right,
+                            ratio: Some(0.5),
+                            children: vec![
+                                crate::config::LayoutNode::Pane(crate::config::LayoutPane {
+                                    pane: Pane::default(),
+                                }),
+                                crate::config::LayoutNode::Pane(crate::config::LayoutPane {
+                                    pane: Pane::default(),
+                                }),
+                            ],
+                        },
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let target = engine::ExistingWorkspace {
+                workspace_id: "w9".into(),
+                tab_id: "w9:t1".into(),
+                root_pane_id: "w9:p1".into(),
+            };
+            let mut rec = RecordingBackend::default();
+
+            engine::apply_to_existing(&ws, &target, &mut rec).unwrap();
+
+            assert_eq!(
+                rec.log,
+                vec!["split_pane from=w9:p1 -> w1:p0 dir=Right focus=false"]
+            );
         }
     }
 

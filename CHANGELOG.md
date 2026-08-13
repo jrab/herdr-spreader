@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+- Add `apply-existing` for applying one configured layout to a supplied Herdr
+  workspace, first tab, and root pane without creating a duplicate workspace.
+
 ## 0.3.0
 
 - Add recursive `layout` trees for arbitrary nested pane arrangements.
