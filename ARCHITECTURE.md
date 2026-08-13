@@ -123,6 +123,12 @@ The subtle part: when `herdr-spreader` runs as a herdr plugin action, `std::env:
 
 The fix in `main.rs`: if `HERDR_PANE_ID` is set (i.e. we were invoked by herdr), query that pane's real shell directory via `herdr pane get <id>` (`CliBackend::query_pane_cwd`, reading the `foreground_cwd` field of the response) and use that as the invocation cwd instead. `std::env::current_dir()` is only used as a fallback — for standalone CLI usage outside of any herdr session, where it's correct.
 
+For `apply-existing`, an explicit absolute `--root` takes precedence over the
+root-pane query. This is important immediately after workspace creation: shell
+startup hooks can transiently visit another directory before settling in the
+workspace. A creator such as Worktrunk already has an authoritative checkout
+path and should pass it instead of sampling mutable pane state.
+
 ```
 HERDR_PANE_ID env var
     │

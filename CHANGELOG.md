@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2
+
+- Allow `apply-existing` callers to pass an authoritative absolute root so
+  shell startup hooks cannot redirect newly split panes into a transient cwd.
+
 ## 0.3.1
 
 - Add `apply-existing` for applying one configured layout to a supplied Herdr

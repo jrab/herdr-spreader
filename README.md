@@ -100,7 +100,7 @@ This works outside of a herdr session too, as long as a herdr server is already 
 
 ```bash
 herdr-spreader apply [--file <path>]
-herdr-spreader apply-existing --workspace-id <id> --tab-id <id> --root-pane-id <id> [--file <path>]
+herdr-spreader apply-existing --workspace-id <id> --tab-id <id> --root-pane-id <id> [--root <path>] [--file <path>]
 ```
 
 | Flag | Description |
@@ -111,6 +111,9 @@ herdr-spreader apply-existing --workspace-id <id> --tab-id <id> --root-pane-id <
 `apply-existing` requires a config containing exactly one workspace. It reuses
 the supplied workspace's first tab and root pane, then creates the configured
 tabs, splits, commands, and focus state without creating a duplicate workspace.
+Pass the absolute `--root` when the caller already knows the workspace
+directory; this avoids transient directories reported while a new pane's shell
+startup hooks are still running.
 This is intended for integrations that already created a Herdr workspace and
 can pass through the IDs returned by that operation.
 

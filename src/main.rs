@@ -58,6 +58,7 @@ fn main() -> anyhow::Result<()> {
             workspace_id,
             tab_id,
             root_pane_id,
+            root,
             dry_run,
         } => {
             let config_path = resolve_config_path(file, &env)?;
@@ -79,9 +80,20 @@ fn main() -> anyhow::Result<()> {
             let bin = CliBackend::resolve_bin(&env);
             let socket_path = env.get("HERDR_SOCKET_PATH").map(PathBuf::from);
             let mut backend = CliBackend::new(bin, socket_path);
-            let cwd = backend
-                .query_pane_cwd(&root_pane_id)
-                .unwrap_or(std::env::current_dir()?);
+            // A freshly created pane can briefly report a directory visited by
+            // shell startup hooks (for example ~/.oh-my-zsh). Callers that
+            // created the workspace already know its authoritative root, so
+            // let them bypass that transient pane state.
+            let cwd = match root {
+                Some(root) if root.is_absolute() => root,
+                Some(root) => anyhow::bail!(
+                    "apply-existing --root must be an absolute path: {}",
+                    root.display()
+                ),
+                None => backend
+                    .query_pane_cwd(&root_pane_id)
+                    .unwrap_or(std::env::current_dir()?),
+            };
             let resolved = resolve_paths(
                 &herdr_spreader::config::SpreadFile {
                     workspaces: vec![workspace.clone()],

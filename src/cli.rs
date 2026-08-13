@@ -29,6 +29,10 @@ pub enum Command {
         tab_id: String,
         #[arg(long)]
         root_pane_id: String,
+        /// Definitive root for relative layout paths. Prefer this when the
+        /// existing pane may still be running shell startup hooks.
+        #[arg(long)]
+        root: Option<PathBuf>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -130,6 +134,36 @@ mod tests {
                 workspace_id: "w2".into(),
                 tab_id: "w2:t1".into(),
                 root_pane_id: "w2:p1".into(),
+                root: None,
+                dry_run: false,
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_apply_existing_with_explicit_root() {
+        let cli = Cli::try_parse_from([
+            "herdr-spreader",
+            "apply-existing",
+            "--workspace-id",
+            "w2",
+            "--tab-id",
+            "w2:t1",
+            "--root-pane-id",
+            "w2:p1",
+            "--root",
+            "/worktrees/topic",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.command,
+            Command::ApplyExisting {
+                file: None,
+                workspace_id: "w2".into(),
+                tab_id: "w2:t1".into(),
+                root_pane_id: "w2:p1".into(),
+                root: Some(PathBuf::from("/worktrees/topic")),
                 dry_run: false,
             }
         );
