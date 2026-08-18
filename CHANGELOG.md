@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.3
+
+- Use Herdr's current `pane wait-output` command when synchronizing pane
+  startup commands.
+
 ## 0.3.2
 
 - Allow `apply-existing` callers to pass an authoritative absolute root so
