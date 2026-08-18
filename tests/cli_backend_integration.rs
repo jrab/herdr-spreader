@@ -127,7 +127,7 @@ fn should_thread_ids_and_apply_focus_via_create_flags_across_two_workspaces_agai
         "pane run wA:p1 nvim",
         "pane split wA:p1 --direction down --ratio 0.3 --no-focus",
         "pane run wA:p3 cargo watch -x test",
-        "wait output wA:p3 --match Compiling --timeout 10000",
+        "pane wait-output wA:p3 --match Compiling --timeout 10000",
         "tab create --workspace wA --label server --no-focus",
         "pane run wA:p2 cargo run",
         "workspace create --label demo2 --focus",
