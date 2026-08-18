@@ -64,8 +64,8 @@ pub(crate) fn pane_run_args(pane_id: &str, command: &str) -> Vec<String> {
 
 pub(crate) fn wait_output_args(pane_id: &str, wait: &WaitFor) -> Vec<String> {
     let mut args = vec![
-        "wait".to_string(),
-        "output".to_string(),
+        "pane".to_string(),
+        "wait-output".to_string(),
         pane_id.to_string(),
         "--match".to_string(),
         wait.pattern.clone(),
@@ -532,8 +532,8 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "wait",
-                "output",
+                "pane",
+                "wait-output",
                 "wA:p2",
                 "--match",
                 "Compiling",
