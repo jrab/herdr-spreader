@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.4
+
+- Make the Herdr `Apply layout` action reuse the invoking workspace, tab, and
+  pane instead of creating a duplicate workspace.
+
 ## 0.3.3
 
 - Use Herdr's current `pane wait-output` command when synchronizing pane

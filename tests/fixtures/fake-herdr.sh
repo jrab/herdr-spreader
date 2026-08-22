@@ -46,6 +46,11 @@ JSON
     ;;
   pane)
     case "$2" in
+      get)
+        cat <<JSON
+{"result":{"type":"pane_info","pane":{"pane_id":"$3","tab_id":"w7:t4","workspace_id":"w7","foreground_cwd":"/project"}}}
+JSON
+        ;;
       split)
         cat <<'JSON'
 {"result":{"type":"pane_info","pane":{"pane_id":"wA:p3","tab_id":"wA:t1"}}}
