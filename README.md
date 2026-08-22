@@ -76,13 +76,21 @@ herdr plugin config-dir herdr-spreader
 # => ~/.config/herdr/plugins/config/herdr-spreader
 ```
 
-Place your layout file named `config.yaml` (or `config.yml`) in that directory. The plugin will find it automatically when invoked. From then on, run the layout from within any herdr workspace:
+Place your layout file named `config.yaml` (or `config.yml`) in that directory. The plugin will find it automatically when invoked. From then on, apply the layout to the current Herdr workspace:
 
 ```bash
 herdr plugin action invoke herdr-spreader.apply
 ```
 
 or trigger it from herdr's action menu (`Apply layout`).
+
+The plugin action keeps the current workspace. If the current tab already has
+multiple panes, Spreader moves the invoking pane into a clean tab and reuses
+the other panes while it builds the configured split tree. Running processes
+remain attached to their panes. Spreader creates only the panes missing from
+the configured layout. Surplus panes remain in the previous tab so applying a
+layout never kills a running process. The config must contain exactly one
+workspace when used through this action.
 
 ### As a standalone CLI
 
@@ -114,8 +122,8 @@ tabs, splits, commands, and focus state without creating a duplicate workspace.
 Pass the absolute `--root` when the caller already knows the workspace
 directory; this avoids transient directories reported while a new pane's shell
 startup hooks are still running.
-This is intended for integrations that already created a Herdr workspace and
-can pass through the IDs returned by that operation.
+The plugin action uses the same in-place engine with IDs from its Herdr context.
+Other integrations can pass through IDs returned when they create a workspace.
 
 ## Configuration reference
 

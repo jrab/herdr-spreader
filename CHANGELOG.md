@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.6
+
+- Ignore the temporary command-palette pane when applying a layout, so the
+  requested pane count and split tree remain after the palette closes.
+
+## 0.3.5
+
+- Rebuild the current tab into the configured split tree when it already has
+  multiple panes. Existing panes and their running processes are reused before
+  Spreader creates any missing panes.
+
+## 0.3.4
+
+- Make the Herdr `Apply layout` action reuse the invoking workspace, tab, and
+  pane instead of creating a duplicate workspace.
+
 ## 0.3.3
 
 - Use Herdr's current `pane wait-output` command when synchronizing pane

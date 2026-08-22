@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::{
-    BackendError, HerdrBackend, SplitOpts, TabCreated, TabOpts, WorkspaceCreated, WorkspaceOpts,
+    BackendError, HerdrBackend, MovePaneOpts, PaneInfo, SplitOpts, TabCreated, TabOpts,
+    WorkspaceCreated, WorkspaceOpts,
 };
 use crate::config::{SplitDirection, WaitFor};
 
@@ -49,6 +50,62 @@ pub(crate) fn pane_split_args(from_pane: &str, opts: &SplitOpts) -> Vec<String> 
     }
     push_cwd(&mut args, opts.cwd.as_ref());
     push_env(&mut args, &opts.env);
+    push_focus_flag(&mut args, opts.focus);
+    args
+}
+
+pub(crate) fn pane_list_args(workspace_id: &str) -> Vec<String> {
+    vec![
+        "pane".to_string(),
+        "list".to_string(),
+        "--workspace".to_string(),
+        workspace_id.to_string(),
+    ]
+}
+
+pub(crate) fn pane_move_to_new_tab_args(
+    pane_id: &str,
+    workspace_id: &str,
+    label: Option<&str>,
+    focus: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "pane".to_string(),
+        "move".to_string(),
+        pane_id.to_string(),
+        "--new-tab".to_string(),
+        "--workspace".to_string(),
+        workspace_id.to_string(),
+    ];
+    if let Some(label) = label {
+        args.push("--label".to_string());
+        args.push(label.to_string());
+    }
+    push_focus_flag(&mut args, focus);
+    args
+}
+
+pub(crate) fn pane_move_to_tab_args(
+    pane_id: &str,
+    tab_id: &str,
+    target_pane_id: &str,
+    opts: &MovePaneOpts,
+) -> Vec<String> {
+    let mut args = vec![
+        "pane".to_string(),
+        "move".to_string(),
+        pane_id.to_string(),
+        "--tab".to_string(),
+        tab_id.to_string(),
+        "--split".to_string(),
+        direction_str(opts.direction).to_string(),
+        "--target-pane".to_string(),
+        target_pane_id.to_string(),
+    ];
+    if let Some(ratio) = opts.ratio {
+        args.push("--ratio".to_string());
+        args.push(ratio.to_string());
+    }
     push_focus_flag(&mut args, opts.focus);
     args
 }
@@ -206,6 +263,53 @@ pub(crate) fn parse_pane_split(json: &str) -> Result<String, BackendError> {
     Ok(body.pane.pane_id)
 }
 
+#[derive(Debug, Deserialize)]
+struct PaneListBody {
+    panes: Vec<PaneListItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneListItem {
+    pane_id: String,
+    tab_id: String,
+}
+
+pub(crate) fn parse_pane_list(json: &str) -> Result<Vec<PaneInfo>, BackendError> {
+    let body: PaneListBody = parse_envelope(json)?;
+    Ok(body
+        .panes
+        .into_iter()
+        .map(|pane| PaneInfo {
+            pane_id: pane.pane_id,
+            tab_id: pane.tab_id,
+        })
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneMoveBody {
+    move_result: PaneMoveResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneMoveResult {
+    pane: PaneMoveItem,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneMoveItem {
+    pane_id: String,
+    tab_id: String,
+}
+
+pub(crate) fn parse_pane_move(json: &str) -> Result<TabCreated, BackendError> {
+    let body: PaneMoveBody = parse_envelope(json)?;
+    Ok(TabCreated {
+        tab_id: body.move_result.pane.tab_id,
+        root_pane_id: body.move_result.pane.pane_id,
+    })
+}
+
 pub(crate) fn pane_get_args(pane_id: &str) -> Vec<String> {
     vec!["pane".to_string(), "get".to_string(), pane_id.to_string()]
 }
@@ -219,11 +323,18 @@ struct PaneCwdBody {
 struct PaneCwdInfo {
     #[serde(default)]
     foreground_cwd: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 pub(crate) fn parse_pane_cwd(json: &str) -> Result<Option<PathBuf>, BackendError> {
     let body: PaneCwdBody = parse_envelope(json)?;
     Ok(body.pane.foreground_cwd.map(PathBuf::from))
+}
+
+pub(crate) fn parse_pane_label(json: &str) -> Result<Option<String>, BackendError> {
+    let body: PaneCwdBody = parse_envelope(json)?;
+    Ok(body.pane.label)
 }
 
 const DEFAULT_HERDR_BIN: &str = "herdr";
@@ -296,6 +407,15 @@ impl CliBackend {
     pub fn query_pane_cwd(&self, pane_id: &str) -> Option<PathBuf> {
         let stdout = self.exec(&pane_get_args(pane_id)).ok()?;
         parse_pane_cwd(&stdout).ok().flatten()
+    }
+
+    /// Best-effort lookup of a pane label. Herdr gives temporary plugin panes
+    /// their entrypoint title, which lets callers avoid treating a command
+    /// palette overlay as durable workspace content.
+    #[must_use]
+    pub fn query_pane_label(&self, pane_id: &str) -> Option<String> {
+        let stdout = self.exec(&pane_get_args(pane_id)).ok()?;
+        parse_pane_label(&stdout).ok().flatten()
     }
 }
 
@@ -398,6 +518,43 @@ impl HerdrBackend for CliBackend {
     fn split_pane(&mut self, from_pane: &str, opts: &SplitOpts) -> Result<String, BackendError> {
         let stdout = self.exec(&pane_split_args(from_pane, opts))?;
         parse_pane_split(&stdout)
+    }
+
+    fn list_panes(&mut self, workspace_id: &str) -> Result<Vec<PaneInfo>, BackendError> {
+        let stdout = self.exec(&pane_list_args(workspace_id))?;
+        parse_pane_list(&stdout)
+    }
+
+    fn move_pane_to_new_tab(
+        &mut self,
+        pane_id: &str,
+        workspace_id: &str,
+        label: Option<&str>,
+        focus: bool,
+    ) -> Result<TabCreated, BackendError> {
+        let stdout = self.exec(&pane_move_to_new_tab_args(
+            pane_id,
+            workspace_id,
+            label,
+            focus,
+        ))?;
+        parse_pane_move(&stdout)
+    }
+
+    fn move_pane_to_tab(
+        &mut self,
+        pane_id: &str,
+        tab_id: &str,
+        target_pane_id: &str,
+        opts: &MovePaneOpts,
+    ) -> Result<String, BackendError> {
+        let stdout = self.exec(&pane_move_to_tab_args(
+            pane_id,
+            tab_id,
+            target_pane_id,
+            opts,
+        ))?;
+        Ok(parse_pane_move(&stdout)?.root_pane_id)
     }
 
     fn run(&mut self, pane_id: &str, command: &str) -> Result<(), BackendError> {
@@ -514,6 +671,59 @@ mod tests {
     }
 
     #[test]
+    fn should_build_pane_list_argv_for_workspace() {
+        assert_eq!(
+            pane_list_args("w7"),
+            vec!["pane", "list", "--workspace", "w7"]
+        );
+    }
+
+    #[test]
+    fn should_build_move_to_new_tab_argv_with_label_and_focus() {
+        assert_eq!(
+            pane_move_to_new_tab_args("w7:p1", "w7", Some("dev"), true),
+            vec![
+                "pane",
+                "move",
+                "w7:p1",
+                "--new-tab",
+                "--workspace",
+                "w7",
+                "--label",
+                "dev",
+                "--focus",
+            ]
+        );
+    }
+
+    #[test]
+    fn should_build_move_to_tab_argv_with_split_target_and_ratio() {
+        let opts = MovePaneOpts {
+            direction: SplitDirection::Right,
+            ratio: Some(0.5),
+            focus: false,
+        };
+
+        assert_eq!(
+            pane_move_to_tab_args("w7:p2", "w7:t2", "w7:p1", &opts),
+            vec![
+                "pane",
+                "move",
+                "w7:p2",
+                "--tab",
+                "w7:t2",
+                "--split",
+                "right",
+                "--target-pane",
+                "w7:p1",
+                "--ratio",
+                "0.5",
+                "--no-focus",
+            ]
+        );
+    }
+
+    #[test]
     fn should_build_pane_run_argv_with_pane_id_and_command() {
         let args = pane_run_args("wA:p1", "cargo test");
 
@@ -597,6 +807,38 @@ mod tests {
     }
 
     #[test]
+    fn should_extract_pane_and_tab_ids_from_pane_list() {
+        let json = r#"{"result":{"type":"pane_list","panes":[{"pane_id":"w7:p1","tab_id":"w7:t1"},{"pane_id":"w7:p2","tab_id":"w7:t2"}]}}"#;
+
+        assert_eq!(
+            parse_pane_list(json).unwrap(),
+            vec![
+                PaneInfo {
+                    pane_id: "w7:p1".into(),
+                    tab_id: "w7:t1".into(),
+                },
+                PaneInfo {
+                    pane_id: "w7:p2".into(),
+                    tab_id: "w7:t2".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn should_extract_moved_pane_and_target_tab_ids() {
+        let json = r#"{"result":{"type":"pane_move","move_result":{"pane":{"pane_id":"w7:p1","tab_id":"w7:t2"}}}}"#;
+
+        assert_eq!(
+            parse_pane_move(json).unwrap(),
+            TabCreated {
+                tab_id: "w7:t2".into(),
+                root_pane_id: "w7:p1".into(),
+            }
+        );
+    }
+
+    #[test]
     fn should_build_pane_get_argv_with_pane_id() {
         let args = pane_get_args("wA:p1");
 
@@ -619,6 +861,15 @@ mod tests {
         let cwd = parse_pane_cwd(json).unwrap();
 
         assert_eq!(cwd, None);
+    }
+
+    #[test]
+    fn should_extract_label_when_parsing_pane_get_response() {
+        let json = r#"{"result":{"type":"pane_info","pane":{"pane_id":"wA:p1","tab_id":"wA:t1","label":"Command palette"}}}"#;
+
+        let label = parse_pane_label(json).unwrap();
+
+        assert_eq!(label.as_deref(), Some("Command palette"));
     }
 
     #[test]

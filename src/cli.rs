@@ -36,6 +36,15 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Apply one configured layout to the workspace, tab, and pane supplied
+    /// by Herdr's plugin action context.
+    #[command(hide = true)]
+    ApplyCurrent {
+        #[arg(long, short)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[cfg(test)]
@@ -165,6 +174,36 @@ mod tests {
                 root_pane_id: "w2:p1".into(),
                 root: Some(PathBuf::from("/worktrees/topic")),
                 dry_run: false,
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_apply_current_for_the_plugin_action() {
+        let cli = Cli::try_parse_from(["herdr-spreader", "apply-current"]).unwrap();
+
+        assert_eq!(
+            cli.command,
+            Command::ApplyCurrent {
+                file: None,
+                dry_run: false,
+            }
+        );
+
+        let cli = Cli::try_parse_from([
+            "herdr-spreader",
+            "apply-current",
+            "--file",
+            "./spread.yml",
+            "--dry-run",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.command,
+            Command::ApplyCurrent {
+                file: Some(PathBuf::from("./spread.yml")),
+                dry_run: true,
             }
         );
     }

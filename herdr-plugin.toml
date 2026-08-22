@@ -1,6 +1,6 @@
 id = "herdr-spreader"
 name = "Spreader"
-version = "0.3.3"
+version = "0.3.6"
 min_herdr_version = "0.7.0"
 description = "Apply tmuxinator-style project layouts from YAML"
 platforms = ["linux", "macos"]
@@ -12,4 +12,7 @@ command = ["cargo", "build", "--release"]
 id = "apply"
 title = "Apply layout"
 contexts = ["workspace"]
-command = ["./target/release/herdr-spreader", "apply"]
+command = [
+  "./target/release/herdr-spreader",
+  "apply-current",
+]

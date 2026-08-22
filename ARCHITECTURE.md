@@ -159,11 +159,17 @@ If you're touching path resolution, add a test for the *specific* combination yo
 
 ## `backend/`: the seam between logic and I/O
 
-`backend/mod.rs` defines `HerdrBackend` — one method per herdr operation the engine needs (`create_workspace`, `create_tab`, `split_pane`, `run`, `wait_output`, `focus_pane`, `rename_tab`), plus the `*Opts`/`*Created` structs passed to and returned from them. This trait is the entire contract between "what layout to build" (`engine.rs`) and "how to actually build it" (`backend/cli.rs`).
+`backend/mod.rs` defines `HerdrBackend`, one method per Herdr operation the
+engine needs. In addition to workspace, tab, split, command, wait, focus, and
+rename operations, it can list and move panes. The move operations let the
+plugin action rebuild an existing tab without killing its running processes.
+This trait is the entire contract between what layout to build in `engine.rs`
+and how to build it in `backend/cli.rs`.
 
 `backend/cli.rs` implements that trait by shelling out to the `herdr` binary and parsing its JSON stdout. Internally it's split into two halves on purpose:
 
-- **Pure functions** (`workspace_create_args`, `tab_create_args`, `pane_split_args`, `pane_run_args`, `wait_output_args`, `focus_args`, `rename_tab_args`, `pane_get_args`, `choose_focus_strategy`, and the matching `parse_*` functions) — no I/O, just `Opts → Vec<String>`, `Option<&str> → FocusStrategy`, and `&str (JSON) → Result<T, BackendError>`. These are unit-tested directly, without spawning anything.
+- **Pure functions** build argument arrays and parse JSON responses for each
+  command. These are unit-tested directly without spawning anything.
 - **`CliBackend`** itself — the thin `impl HerdrBackend` that calls those pure functions and then actually runs `std::process::Command`. It's spawned via an argv array (`Command::args`, never a shell string), so there's no shell-injection surface at the herdr-invocation boundary — the only place shell syntax appears is inside the *pane's own command string*, which is sent to that pane's interactive shell via `herdr pane run`, exactly as if the user had typed it themselves.
 
 `CliBackend::resolve_bin` picks the `herdr` binary to spawn: `$HERDR_BIN_PATH` if set (mainly for tests), otherwise `herdr` on `$PATH`.
