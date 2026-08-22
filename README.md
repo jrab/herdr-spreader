@@ -84,10 +84,13 @@ herdr plugin action invoke herdr-spreader.apply
 
 or trigger it from herdr's action menu (`Apply layout`).
 
-The plugin action reuses the workspace, current tab, and current pane that
-invoked it. It adds the configured tabs and splits in place instead of creating
-a duplicate workspace. The config must contain exactly one workspace when used
-through this action.
+The plugin action keeps the current workspace. If the current tab already has
+multiple panes, Spreader moves the invoking pane into a clean tab and reuses
+the other panes while it builds the configured split tree. Running processes
+remain attached to their panes. Spreader creates only the panes missing from
+the configured layout. Surplus panes remain in the previous tab so applying a
+layout never kills a running process. The config must contain exactly one
+workspace when used through this action.
 
 ### As a standalone CLI
 

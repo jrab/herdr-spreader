@@ -49,8 +49,10 @@ fn should_apply_plugin_action_layout_to_supplied_context_without_creating_worksp
         log.lines().collect::<Vec<_>>(),
         vec![
             "pane get w7:p9",
-            "tab rename w7:t4 dev",
-            "pane split w7:p9 --direction right --ratio 0.5 --cwd /project --no-focus",
+            "pane list --workspace w7",
+            "pane move w7:p9 --new-tab --workspace w7 --label dev --focus",
+            "tab rename w7:t5 dev",
+            "pane move w7:p10 --tab w7:t5 --split right --target-pane w7:p9 --ratio 0.5 --no-focus",
         ]
     );
     assert!(!log.contains("workspace create"));

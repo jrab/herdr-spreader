@@ -51,6 +51,16 @@ JSON
 {"result":{"type":"pane_info","pane":{"pane_id":"$3","tab_id":"w7:t4","workspace_id":"w7","foreground_cwd":"/project"}}}
 JSON
         ;;
+      list)
+        cat <<'JSON'
+{"result":{"type":"pane_list","panes":[{"pane_id":"w7:p9","tab_id":"w7:t4"},{"pane_id":"w7:p10","tab_id":"w7:t4"}]}}
+JSON
+        ;;
+      move)
+        cat <<JSON
+{"result":{"type":"pane_move","move_result":{"pane":{"pane_id":"$3","tab_id":"w7:t5"}}}}
+JSON
+        ;;
       split)
         cat <<'JSON'
 {"result":{"type":"pane_info","pane":{"pane_id":"wA:p3","tab_id":"wA:t1"}}}

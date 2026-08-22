@@ -35,6 +35,19 @@ pub struct TabCreated {
     pub root_pane_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneInfo {
+    pub pane_id: String,
+    pub tab_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MovePaneOpts {
+    pub direction: SplitDirection,
+    pub ratio: Option<f64>,
+    pub focus: bool,
+}
+
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct SplitOpts {
     pub direction: SplitDirection,
@@ -84,6 +97,39 @@ pub trait HerdrBackend {
     ///
     /// Returns [`BackendError`] if the underlying command fails.
     fn split_pane(&mut self, from_pane: &str, opts: &SplitOpts) -> Result<String, BackendError>;
+
+    /// List panes in a workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if the underlying command fails.
+    fn list_panes(&mut self, workspace_id: &str) -> Result<Vec<PaneInfo>, BackendError>;
+
+    /// Move a pane into a newly created tab in the same workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if the underlying command fails.
+    fn move_pane_to_new_tab(
+        &mut self,
+        pane_id: &str,
+        workspace_id: &str,
+        label: Option<&str>,
+        focus: bool,
+    ) -> Result<TabCreated, BackendError>;
+
+    /// Move an existing pane into a split in another tab.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if the underlying command fails.
+    fn move_pane_to_tab(
+        &mut self,
+        pane_id: &str,
+        tab_id: &str,
+        target_pane_id: &str,
+        opts: &MovePaneOpts,
+    ) -> Result<String, BackendError>;
 
     /// Run a command inside the given pane.
     ///

@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt::Write;
 use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::backend::{BackendError, HerdrBackend, SplitOpts, TabOpts, WorkspaceOpts};
+use crate::backend::{
+    BackendError, HerdrBackend, MovePaneOpts, PaneInfo, SplitOpts, TabOpts, WorkspaceOpts,
+};
 use crate::config::{LayoutNode, Pane, SplitDirection, SpreadFile, Tab, WaitFor, Workspace};
 
 fn resolve_cwd(
@@ -109,6 +112,8 @@ struct Executor {
     workspace_id: Option<String>,
     tab0_id: Option<String>,
     panes: HashMap<PaneHandle, String>,
+    pane_tabs: HashMap<PaneHandle, String>,
+    reusable_tab0_panes: VecDeque<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +129,18 @@ impl Executor {
             workspace_id: Some(target.workspace_id.clone()),
             tab0_id: Some(target.tab_id.clone()),
             panes: HashMap::from([(PaneHandle::TabRoot(0), target.root_pane_id.clone())]),
+            pane_tabs: HashMap::from([(PaneHandle::TabRoot(0), target.tab_id.clone())]),
+            reusable_tab0_panes: VecDeque::new(),
+        }
+    }
+
+    fn in_reflowed_workspace(target: &ExistingWorkspace, reusable_tab0_panes: Vec<String>) -> Self {
+        Self {
+            workspace_id: Some(target.workspace_id.clone()),
+            tab0_id: Some(target.tab_id.clone()),
+            panes: HashMap::from([(PaneHandle::TabRoot(0), target.root_pane_id.clone())]),
+            pane_tabs: HashMap::from([(PaneHandle::TabRoot(0), target.tab_id.clone())]),
+            reusable_tab0_panes: reusable_tab0_panes.into(),
         }
     }
 }
@@ -154,8 +171,9 @@ fn execute_plan_with_executor(
             BackendOp::CreateWorkspace(opts) => {
                 let c = backend.create_workspace(opts)?;
                 ex.workspace_id = Some(c.workspace_id);
-                ex.tab0_id = Some(c.tab_id);
+                ex.tab0_id = Some(c.tab_id.clone());
                 ex.panes.insert(PaneHandle::TabRoot(0), c.root_pane_id);
+                ex.pane_tabs.insert(PaneHandle::TabRoot(0), c.tab_id);
             }
             BackendOp::RenameFirstTab { label } => {
                 backend.rename_tab(
@@ -173,6 +191,7 @@ fn execute_plan_with_executor(
                     opts,
                 )?;
                 ex.panes.insert(PaneHandle::TabRoot(*index), c.root_pane_id);
+                ex.pane_tabs.insert(PaneHandle::TabRoot(*index), c.tab_id);
             }
             BackendOp::SplitPane { from, into, opts } => {
                 let src = ex
@@ -180,8 +199,31 @@ fn execute_plan_with_executor(
                     .get(from)
                     .expect("SplitPane from unknown handle")
                     .clone();
-                let new_id = backend.split_pane(&src, opts)?;
+                let tab_id = ex
+                    .pane_tabs
+                    .get(from)
+                    .expect("SplitPane from handle without tab")
+                    .clone();
+                let new_id = if ex.tab0_id.as_deref() == Some(tab_id.as_str()) {
+                    if let Some(reusable_pane) = ex.reusable_tab0_panes.pop_front() {
+                        backend.move_pane_to_tab(
+                            &reusable_pane,
+                            &tab_id,
+                            &src,
+                            &MovePaneOpts {
+                                direction: opts.direction,
+                                ratio: opts.ratio,
+                                focus: opts.focus,
+                            },
+                        )?
+                    } else {
+                        backend.split_pane(&src, opts)?
+                    }
+                } else {
+                    backend.split_pane(&src, opts)?
+                };
                 ex.panes.insert(into.clone(), new_id);
+                ex.pane_tabs.insert(into.clone(), tab_id);
             }
             BackendOp::Run { pane, command } => {
                 let id = ex.panes.get(pane).expect("Run unknown handle");
@@ -226,6 +268,48 @@ pub fn apply_to_existing(
         &plan_existing_workspace(ws),
         backend,
         Executor::in_existing_workspace(target),
+    )
+}
+
+/// Rebuild the configured first-tab layout inside the current workspace.
+/// Existing panes from the current tab are moved into the new tree before new
+/// panes are split, which preserves their running processes.
+///
+/// # Errors
+///
+/// Returns [`EngineError::Backend`] if any backend operation fails.
+pub fn apply_to_current(
+    ws: &Workspace,
+    target: &ExistingWorkspace,
+    existing_panes: &[PaneInfo],
+    backend: &mut dyn HerdrBackend,
+) -> Result<(), EngineError> {
+    let reusable_panes: Vec<String> = existing_panes
+        .iter()
+        .filter(|pane| pane.tab_id == target.tab_id && pane.pane_id != target.root_pane_id)
+        .map(|pane| pane.pane_id.clone())
+        .collect();
+
+    if reusable_panes.is_empty() || ws.tabs.is_empty() {
+        return apply_to_existing(ws, target, backend);
+    }
+
+    let moved_root = backend.move_pane_to_new_tab(
+        &target.root_pane_id,
+        &target.workspace_id,
+        ws.tabs[0].label.as_deref(),
+        true,
+    )?;
+    let reflowed_target = ExistingWorkspace {
+        workspace_id: target.workspace_id.clone(),
+        tab_id: moved_root.tab_id,
+        root_pane_id: moved_root.root_pane_id,
+    };
+
+    execute_plan_with_executor(
+        &plan_existing_workspace(ws),
+        backend,
+        Executor::in_reflowed_workspace(&reflowed_target, reusable_panes),
     )
 }
 
@@ -543,7 +627,8 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::backend::{
-        BackendError, HerdrBackend, SplitOpts, TabCreated, TabOpts, WorkspaceCreated, WorkspaceOpts,
+        BackendError, HerdrBackend, MovePaneOpts, PaneInfo, SplitOpts, TabCreated, TabOpts,
+        WorkspaceCreated, WorkspaceOpts,
     };
     use crate::config::{Pane, SplitDirection, SpreadFile, Tab, WaitFor, Workspace};
     use crate::engine;
@@ -601,6 +686,40 @@ mod tests {
                 opts.direction, opts.focus
             ));
             Ok(p)
+        }
+
+        fn list_panes(&mut self, _workspace_id: &str) -> Result<Vec<PaneInfo>, BackendError> {
+            unreachable!("engine tests pass pane inventory directly")
+        }
+
+        fn move_pane_to_new_tab(
+            &mut self,
+            pane_id: &str,
+            workspace_id: &str,
+            label: Option<&str>,
+            focus: bool,
+        ) -> Result<TabCreated, BackendError> {
+            self.log.push(format!(
+                "move_pane_to_new_tab pane={pane_id} workspace={workspace_id} label={label:?} focus={focus}"
+            ));
+            Ok(TabCreated {
+                tab_id: format!("{workspace_id}:t9"),
+                root_pane_id: pane_id.to_string(),
+            })
+        }
+
+        fn move_pane_to_tab(
+            &mut self,
+            pane_id: &str,
+            tab_id: &str,
+            target_pane_id: &str,
+            opts: &MovePaneOpts,
+        ) -> Result<String, BackendError> {
+            self.log.push(format!(
+                "move_pane_to_tab pane={pane_id} tab={tab_id} target={target_pane_id} dir={:?} focus={}",
+                opts.direction, opts.focus
+            ));
+            Ok(pane_id.to_string())
         }
 
         fn run(&mut self, pane_id: &str, command: &str) -> Result<(), BackendError> {
@@ -846,6 +965,73 @@ mod tests {
             assert_eq!(
                 rec.log,
                 vec!["split_pane from=w9:p1 -> w1:p0 dir=Right focus=false"]
+            );
+        }
+
+        #[test]
+        fn should_reflow_existing_tab_and_reuse_its_second_pane() {
+            let ws = Workspace {
+                name: "ignored".into(),
+                tabs: vec![Tab {
+                    label: Some("dev".into()),
+                    layout: Some(crate::config::LayoutNode::Split(
+                        crate::config::LayoutSplit {
+                            split: SplitDirection::Right,
+                            ratio: Some(0.5),
+                            children: vec![
+                                crate::config::LayoutNode::Split(crate::config::LayoutSplit {
+                                    split: SplitDirection::Down,
+                                    ratio: Some(0.5),
+                                    children: vec![
+                                        crate::config::LayoutNode::Pane(
+                                            crate::config::LayoutPane {
+                                                pane: Pane::default(),
+                                            },
+                                        ),
+                                        crate::config::LayoutNode::Pane(
+                                            crate::config::LayoutPane {
+                                                pane: Pane::default(),
+                                            },
+                                        ),
+                                    ],
+                                }),
+                                crate::config::LayoutNode::Pane(crate::config::LayoutPane {
+                                    pane: Pane::default(),
+                                }),
+                            ],
+                        },
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let target = engine::ExistingWorkspace {
+                workspace_id: "w9".into(),
+                tab_id: "w9:t1".into(),
+                root_pane_id: "w9:p1".into(),
+            };
+            let existing = vec![
+                PaneInfo {
+                    pane_id: "w9:p1".into(),
+                    tab_id: "w9:t1".into(),
+                },
+                PaneInfo {
+                    pane_id: "w9:p2".into(),
+                    tab_id: "w9:t1".into(),
+                },
+            ];
+            let mut rec = RecordingBackend::default();
+
+            engine::apply_to_current(&ws, &target, &existing, &mut rec).unwrap();
+
+            assert_eq!(
+                rec.log,
+                vec![
+                    "move_pane_to_new_tab pane=w9:p1 workspace=w9 label=Some(\"dev\") focus=true",
+                    "rename_tab w9:t9 -> dev",
+                    "move_pane_to_tab pane=w9:p2 tab=w9:t9 target=w9:p1 dir=Right focus=false",
+                    "split_pane from=w9:p1 -> w1:p0 dir=Down focus=false",
+                ]
             );
         }
     }

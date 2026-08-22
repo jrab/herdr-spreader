@@ -3,11 +3,18 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use herdr_spreader::backend::HerdrBackend;
 use herdr_spreader::backend::cli::CliBackend;
 use herdr_spreader::cli::{Cli, Command};
 use herdr_spreader::config::{read_config, resolve_config_path, resolve_paths};
 use herdr_spreader::engine;
 use herdr_spreader::validate;
+
+#[derive(Clone, Copy)]
+enum ExistingApplyMode {
+    KeepCurrentTab,
+    ReflowCurrentTab,
+}
 
 fn main() -> anyhow::Result<()> {
     let env: BTreeMap<String, String> = std::env::vars().collect();
@@ -70,6 +77,7 @@ fn main() -> anyhow::Result<()> {
             root,
             dry_run,
             &env,
+            ExistingApplyMode::KeepCurrentTab,
         ),
         Command::ApplyCurrent { file, dry_run } => apply_existing(
             file,
@@ -81,6 +89,7 @@ fn main() -> anyhow::Result<()> {
             None,
             dry_run,
             &env,
+            ExistingApplyMode::ReflowCurrentTab,
         ),
     }
 }
@@ -98,6 +107,7 @@ fn apply_existing(
     root: Option<PathBuf>,
     dry_run: bool,
     env: &BTreeMap<String, String>,
+    mode: ExistingApplyMode,
 ) -> anyhow::Result<()> {
     let config_path = resolve_config_path(file, env)?;
     let contents = read_config(&config_path)?;
@@ -147,7 +157,15 @@ fn apply_existing(
         return Ok(());
     }
 
-    engine::apply_to_existing(workspace, target, &mut backend)?;
+    match mode {
+        ExistingApplyMode::KeepCurrentTab => {
+            engine::apply_to_existing(workspace, target, &mut backend)?;
+        }
+        ExistingApplyMode::ReflowCurrentTab => {
+            let panes = backend.list_panes(&target.workspace_id)?;
+            engine::apply_to_current(workspace, target, &panes, &mut backend)?;
+        }
+    }
     Ok(())
 }
 

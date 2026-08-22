@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.5
+
+- Rebuild the current tab into the configured split tree when it already has
+  multiple panes. Existing panes and their running processes are reused before
+  Spreader creates any missing panes.
+
 ## 0.3.4
 
 - Make the Herdr `Apply layout` action reuse the invoking workspace, tab, and
