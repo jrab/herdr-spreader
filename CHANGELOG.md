@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.6
+
+- Ignore the temporary command-palette pane when applying a layout, so the
+  requested pane count and split tree remain after the palette closes.
+
 ## 0.3.5
 
 - Rebuild the current tab into the configured split tree when it already has

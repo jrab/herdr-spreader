@@ -101,6 +101,46 @@ fn plugin_context_id(env: &BTreeMap<String, String>, name: &str) -> anyhow::Resu
         .ok_or_else(|| anyhow::anyhow!("apply-current requires {name} from Herdr's plugin context"))
 }
 
+fn is_transient_palette(label: Option<&str>) -> bool {
+    matches!(label, Some("Command palette" | "Palette"))
+}
+
+fn without_transient_palette(
+    target: &engine::ExistingWorkspace,
+    panes: Vec<herdr_spreader::backend::PaneInfo>,
+    invoking_pane_label: Option<&str>,
+) -> anyhow::Result<(
+    engine::ExistingWorkspace,
+    Vec<herdr_spreader::backend::PaneInfo>,
+)> {
+    if !is_transient_palette(invoking_pane_label) {
+        return Ok((target.clone(), panes));
+    }
+
+    let durable_panes: Vec<_> = panes
+        .into_iter()
+        .filter(|pane| pane.pane_id != target.root_pane_id)
+        .collect();
+    let root_pane_id = durable_panes
+        .iter()
+        .find(|pane| pane.tab_id == target.tab_id)
+        .map(|pane| pane.pane_id.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "apply-current could not find a durable pane behind the temporary palette"
+            )
+        })?;
+
+    Ok((
+        engine::ExistingWorkspace {
+            workspace_id: target.workspace_id.clone(),
+            tab_id: target.tab_id.clone(),
+            root_pane_id,
+        },
+        durable_panes,
+    ))
+}
+
 fn apply_existing(
     file: Option<PathBuf>,
     target: &engine::ExistingWorkspace,
@@ -163,7 +203,10 @@ fn apply_existing(
         }
         ExistingApplyMode::ReflowCurrentTab => {
             let panes = backend.list_panes(&target.workspace_id)?;
-            engine::apply_to_current(workspace, target, &panes, &mut backend)?;
+            let invoking_pane_label = backend.query_pane_label(&target.root_pane_id);
+            let (target, panes) =
+                without_transient_palette(target, panes, invoking_pane_label.as_deref())?;
+            engine::apply_to_current(workspace, &target, &panes, &mut backend)?;
         }
     }
     Ok(())

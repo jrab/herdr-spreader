@@ -323,11 +323,18 @@ struct PaneCwdBody {
 struct PaneCwdInfo {
     #[serde(default)]
     foreground_cwd: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 pub(crate) fn parse_pane_cwd(json: &str) -> Result<Option<PathBuf>, BackendError> {
     let body: PaneCwdBody = parse_envelope(json)?;
     Ok(body.pane.foreground_cwd.map(PathBuf::from))
+}
+
+pub(crate) fn parse_pane_label(json: &str) -> Result<Option<String>, BackendError> {
+    let body: PaneCwdBody = parse_envelope(json)?;
+    Ok(body.pane.label)
 }
 
 const DEFAULT_HERDR_BIN: &str = "herdr";
@@ -400,6 +407,15 @@ impl CliBackend {
     pub fn query_pane_cwd(&self, pane_id: &str) -> Option<PathBuf> {
         let stdout = self.exec(&pane_get_args(pane_id)).ok()?;
         parse_pane_cwd(&stdout).ok().flatten()
+    }
+
+    /// Best-effort lookup of a pane label. Herdr gives temporary plugin panes
+    /// their entrypoint title, which lets callers avoid treating a command
+    /// palette overlay as durable workspace content.
+    #[must_use]
+    pub fn query_pane_label(&self, pane_id: &str) -> Option<String> {
+        let stdout = self.exec(&pane_get_args(pane_id)).ok()?;
+        parse_pane_label(&stdout).ok().flatten()
     }
 }
 
@@ -845,6 +861,15 @@ mod tests {
         let cwd = parse_pane_cwd(json).unwrap();
 
         assert_eq!(cwd, None);
+    }
+
+    #[test]
+    fn should_extract_label_when_parsing_pane_get_response() {
+        let json = r#"{"result":{"type":"pane_info","pane":{"pane_id":"wA:p1","tab_id":"wA:t1","label":"Command palette"}}}"#;
+
+        let label = parse_pane_label(json).unwrap();
+
+        assert_eq!(label.as_deref(), Some("Command palette"));
     }
 
     #[test]

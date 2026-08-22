@@ -47,14 +47,24 @@ JSON
   pane)
     case "$2" in
       get)
+        label=""
+        if [ -n "${FAKE_HERDR_PANE_LABEL:-}" ]; then
+          label=",\"label\":\"$FAKE_HERDR_PANE_LABEL\""
+        fi
         cat <<JSON
-{"result":{"type":"pane_info","pane":{"pane_id":"$3","tab_id":"w7:t4","workspace_id":"w7","foreground_cwd":"/project"}}}
+{"result":{"type":"pane_info","pane":{"pane_id":"$3","tab_id":"w7:t4","workspace_id":"w7","foreground_cwd":"/project"$label}}}
 JSON
         ;;
       list)
-        cat <<'JSON'
+        if [ "${FAKE_HERDR_INCLUDE_PALETTE:-}" = 1 ]; then
+          cat <<'JSON'
+{"result":{"type":"pane_list","panes":[{"pane_id":"w7:p1","tab_id":"w7:t4"},{"pane_id":"w7:p10","tab_id":"w7:t4"},{"pane_id":"w7:p9","tab_id":"w7:t4"}]}}
+JSON
+        else
+          cat <<'JSON'
 {"result":{"type":"pane_list","panes":[{"pane_id":"w7:p9","tab_id":"w7:t4"},{"pane_id":"w7:p10","tab_id":"w7:t4"}]}}
 JSON
+        fi
         ;;
       move)
         cat <<JSON
